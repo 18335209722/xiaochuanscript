@@ -331,14 +331,19 @@ snapshot_settings() {
 set_timezone() {
     [ "$DO_TZ" = "1" ] || return 0
     log "当前时区 $(current_tz)，准备设置…"
+    local out=""
     if [ "$OS" = "mac" ]; then
         # 先关掉「自动设置时区」，否则会被定位改回去。
-        run_root defaults write /Library/Preferences/com.apple.timezone.auto Active -bool false
-        if ! run_root systemsetup -settimezone "$TARGET_TZ" >/dev/null 2>&1; then
-            # systemsetup 在部分系统上被限制，退回直接改链接。
-            if ! run_root ln -sf "/var/db/timezone/zoneinfo/$TARGET_TZ" /etc/localtime; then
-                fail "时区设置失败。"
-                return 1
+        run_root defaults write /Library/Preferences/com.apple.timezone.auto Active -bool false \
+            || log "警告：关闭「自动设置时区」失败，时区之后可能被系统改回去。"
+        if [ "$DRY_RUN" = "1" ]; then
+            run_root systemsetup -settimezone "$TARGET_TZ"
+        else
+            # systemsetup 失败时也经常返回 0，所以不看返回值，只看时区实际有没有变。
+            out="$(run_root systemsetup -settimezone "$TARGET_TZ" 2>&1)"
+            if [ "$(current_tz)" != "$TARGET_TZ" ]; then
+                # systemsetup 在部分系统上被限制，退回直接改链接。
+                run_root ln -sf "/var/db/timezone/zoneinfo/$TARGET_TZ" /etc/localtime
             fi
         fi
     elif command -v timedatectl >/dev/null 2>&1; then
@@ -352,6 +357,13 @@ set_timezone() {
             return 1
         fi
         [ -f /etc/timezone ] && run_root sh -c "echo $TARGET_TZ > /etc/timezone"
+    fi
+    [ "$DRY_RUN" = "1" ] && return 0
+    # 以实际结果为准，不能只看命令有没有报错。
+    if [ "$(current_tz)" != "$TARGET_TZ" ]; then
+        fail "时区设置失败：当前仍是 $(current_tz)。"
+        [ -n "$out" ] && printf '%s\n' "$out" >&2
+        return 1
     fi
     log "时区已设为 $TARGET_TZ。"
 }
@@ -556,10 +568,21 @@ run_pipeline() {
         confirm "会删除 Claude Code 的会话记录、自动记忆和提示词历史，无法恢复。确定继续？" || DO_HISTORY=0
     fi
     if [ "$DO_TZ" = "1" ] || [ "$DO_LANG" = "1" ]; then
+        # 先一次性拿到管理员权限，拿不到就明说，不要等到后面静默失败。
+        # mac 的语言 / 键盘是用户级设置，不需要 root；Linux 两项都需要。
         if [ "$DRY_RUN" != "1" ] && [ "$(id -u)" != "0" ]; then
-            log "修改时区 / 语言需要管理员权限，接下来可能要输入 sudo 密码。"
+            if [ "$DO_TZ" = "1" ] || [ "$OS" != "mac" ]; then
+                log "修改时区 / 语言需要管理员权限，请输入本机登录密码（输入时不显示）。"
+                if ! sudo -v; then
+                    fail "没有拿到管理员权限（密码不对，或当前账户不是管理员），跳过需要管理员权限的项目。"
+                    DO_TZ=0
+                    [ "$OS" = "mac" ] || DO_LANG=0
+                fi
+            fi
         fi
-        snapshot_settings
+        if [ "$DO_TZ" = "1" ] || [ "$DO_LANG" = "1" ]; then
+            snapshot_settings
+        fi
     fi
     clean_claude
     clean_chrome
