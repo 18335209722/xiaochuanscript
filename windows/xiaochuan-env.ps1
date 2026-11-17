@@ -46,6 +46,13 @@ $script:DoTz = $false
 $script:DoLang = $false
 $script:RemoveUserData = [bool]$RemoveData
 
+# ~.claude 下要清理的项目；执行后检查也用这两份清单。
+$script:ClaudeCacheItems = 'cache', 'debug', 'paste-cache', 'image-cache', 'usage-data', 'feedback-bundles',
+    'feedbackdrafts', 'shell-snapshots', 'session-env', 'plans', 'todos', 'statsig', 'logs',
+    'sessions', 'seed-admin', 'downloads', 'skills.trash', 'plugins.trash',
+    'remote-settings.json', 'policy-limits.json', 'policy-limits.json.stamp.json', 'stats-cache.json'
+$script:ClaudeHistoryItems = 'projects', 'file-history', 'backups', 'tasks', 'history', 'history.jsonl'
+
 function Write-Log([string]$Message) { Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $Message) }
 function Write-Note([string]$Message) { Write-Host ("[{0}] 注意：{1}" -f (Get-Date -Format 'HH:mm:ss'), $Message) -ForegroundColor Yellow }
 function Write-Fail([string]$Message) {
@@ -57,6 +64,38 @@ function Confirm-Step([string]$Question) {
     if ($Yes) { return $true }
     $answer = Read-Host "$Question [y/N]"
     return ($answer -match '^(y|yes)$')
+}
+
+# 调用外部命令并收集全部输出。PowerShell 5.1 在 ErrorActionPreference=Stop 时，
+# 外部命令只要往 stderr 写一行就会被当成异常抛出，所以这里临时改成 Continue。
+function Invoke-Native([scriptblock]$Block) {
+    $ErrorActionPreference = 'Continue'
+    $lines = & $Block 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" }
+    }
+    return (($lines | Out-String).Trim())
+}
+
+# 依次尝试多种方式做同一件事：每试一种就用 $Check 核对，成功即停；全部试完还不行才算失败。
+function Invoke-Methods([string]$Name, [scriptblock]$Check, [scriptblock[]]$Methods) {
+    $tried = 0
+    $errs = @()
+    foreach ($m in $Methods) {
+        $ok = $false
+        try { $ok = [bool](& $Check) } catch { }
+        if ($ok) { return $true }
+        $tried++
+        try { & $m | Out-Null } catch { $errs += $_.Exception.Message }
+    }
+    $ok = $false
+    try { $ok = [bool](& $Check) } catch { }
+    if ($ok) { return $true }
+    Write-Fail "$Name 失败：试了 $tried 种方式都没成功。$($errs -join '；')"
+    return $false
+}
+
+function Get-RegValue([string]$Path, [string]$Name) {
+    try { return (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name } catch { return $null }
 }
 
 function Test-Admin {
@@ -95,11 +134,27 @@ function Remove-Safe([string]$Path, [string]$Root) {
     if ($DryRun) {
         Write-Log "（演练）删除 $full（$(Format-Size $size)）"
     } else {
-        try {
-            Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
-        } catch {
-            Write-Fail "删除失败：$full（$($_.Exception.Message)）"; return
-        }
+        # 普通方式删不掉时，依次去掉只读属性、用 rd/del 强删、夺取所有权后再删；每次都核对是否真的没了。
+        $isDir = Test-Path -LiteralPath $full -PathType Container
+        $gone = Invoke-Methods "删除 $full" { -not (Test-Path -LiteralPath $full) } @(
+            { Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop },
+            {
+                Invoke-Native { attrib.exe -R -S -H $full /S /D } | Out-Null
+                Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
+            },
+            {
+                if ($isDir) { Invoke-Native { cmd.exe /c rd /s /q "$full" } | Out-Null }
+                else { Invoke-Native { cmd.exe /c del /f /q "$full" } | Out-Null }
+            },
+            {
+                if ($isDir) { Invoke-Native { takeown.exe /F $full /R /A /D Y } | Out-Null }
+                else { Invoke-Native { takeown.exe /F $full /A } | Out-Null }
+                Invoke-Native { icacls.exe $full /grant '*S-1-5-32-544:F' /T /C /Q } | Out-Null
+                if ($isDir) { Invoke-Native { cmd.exe /c rd /s /q "$full" } | Out-Null }
+                else { Invoke-Native { cmd.exe /c del /f /q "$full" } | Out-Null }
+            }
+        )
+        if (-not $gone) { return }
     }
     $script:FreedBytes += $size
     $script:Removed++
@@ -120,10 +175,15 @@ function Test-ChromeRunning {
     return [bool](Get-Process -Name 'chrome' -ErrorAction SilentlyContinue)
 }
 
-# 正常关闭 Chrome（等同于点窗口的 X，标签页下次可以恢复），不强杀。
-function Stop-ChromeGracefully {
-    & taskkill.exe /IM chrome.exe 2>$null | Out-Null
+# 关闭 Chrome：先正常关闭（等同于点窗口的 X，标签页下次可以恢复），
+# 关不掉（后台进程、托盘常驻、卡在弹窗）再强制结束。
+function Stop-Chrome {
+    Invoke-Native { taskkill.exe /IM chrome.exe } | Out-Null
     for ($i = 0; $i -lt 10 -and (Test-ChromeRunning); $i++) { Start-Sleep -Seconds 1 }
+    if (Test-ChromeRunning) {
+        Get-Process -Name 'chrome' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        for ($i = 0; $i -lt 10 -and (Test-ChromeRunning); $i++) { Start-Sleep -Seconds 1 }
+    }
     return (-not (Test-ChromeRunning))
 }
 
@@ -139,11 +199,7 @@ function Clear-Claude {
 
     if ($script:DoCache) {
         Write-Log '正在清理 Claude Code 缓存、日志和临时文件…'
-        $items = 'cache', 'debug', 'paste-cache', 'image-cache', 'usage-data', 'feedback-bundles',
-            'feedback\drafts', 'shell-snapshots', 'session-env', 'plans', 'todos', 'statsig', 'logs',
-            'sessions', 'seed-admin', 'downloads', 'skills\.trash', 'plugins\.trash',
-            'remote-settings.json', 'policy-limits.json', 'policy-limits.json.stamp.json', 'stats-cache.json'
-        foreach ($item in $items) { Remove-Safe (Join-Path $ClaudeDir $item) $ClaudeDir }
+        foreach ($item in $script:ClaudeCacheItems) { Remove-Safe (Join-Path $ClaudeDir $item) $ClaudeDir }
 
         # MCP 日志缓存
         Remove-Safe (Join-Path $env:LOCALAPPDATA 'claude-cli-nodejs') $env:LOCALAPPDATA
@@ -162,7 +218,7 @@ function Clear-Claude {
 
     if ($script:DoHistory) {
         Write-Log '正在清理 Claude Code 会话历史（删除后无法恢复旧会话）…'
-        foreach ($item in 'projects', 'file-history', 'backups', 'tasks', 'history', 'history.jsonl') {
+        foreach ($item in $script:ClaudeHistoryItems) {
             Remove-Safe (Join-Path $ClaudeDir $item) $ClaudeDir
         }
     }
@@ -180,7 +236,7 @@ function New-JsonSerializer {
 }
 
 # 用 JavaScriptSerializer 而不是 ConvertFrom-Json：后者遇到只差大小写的键或空键会报错。
-function Set-ChromeJson([string]$File, [string]$Mode) {
+function Set-ChromeJsonCore([string]$File, [string]$Mode) {
     $ser = New-JsonSerializer
     $data = $ser.DeserializeObject([IO.File]::ReadAllText($File, [Text.Encoding]::UTF8))
     if (-not ($data -is [System.Collections.IDictionary])) { throw '文件内容不是 JSON 对象' }
@@ -196,6 +252,30 @@ function Set-ChromeJson([string]$File, [string]$Mode) {
     $tmp = "$File.xc-tmp"
     [IO.File]::WriteAllText($tmp, $ser.Serialize($data), (New-Object Text.UTF8Encoding($false)))
     Move-Item -LiteralPath $tmp -Destination $File -Force
+}
+
+# 读回文件核对语言是否已经是目标值。
+function Test-ChromeJson([string]$File, [string]$Mode) {
+    try { $text = [IO.File]::ReadAllText($File, [Text.Encoding]::UTF8) } catch { return $false }
+    if ($Mode -eq 'local') { return ($text -match '"app_locale"\s*:\s*"en-US"') }
+    return ($text -match '"accept_languages"\s*:\s*"en-US,en"')
+}
+
+# 改 Chrome 配置文件的语言：直接改不行就去掉只读属性再改，再不行就夺取所有权后再改；每次都读回核对。
+function Set-ChromeJson([string]$File, [string]$Mode, [string]$Label) {
+    return (Invoke-Methods "$Label 的语言改为 en-US" { Test-ChromeJson $File $Mode } @(
+        { Set-ChromeJsonCore $File $Mode },
+        {
+            Invoke-Native { attrib.exe -R -S -H $File } | Out-Null
+            Set-ChromeJsonCore $File $Mode
+        },
+        {
+            Invoke-Native { takeown.exe /F $File /A } | Out-Null
+            Invoke-Native { icacls.exe $File /grant '*S-1-5-32-544:F' /C /Q } | Out-Null
+            Invoke-Native { icacls.exe $File /grant "${env:USERNAME}:F" /C /Q } | Out-Null
+            Set-ChromeJsonCore $File $Mode
+        }
+    ))
 }
 
 function Get-ChromeLang {
@@ -215,12 +295,15 @@ function Clear-Chrome {
     }
     if (Test-ChromeRunning) {
         if ($DryRun) {
-            Write-Note 'Chrome 正在运行；正式执行时会先询问是否帮你关闭 Chrome。'
-        } elseif ((Confirm-Step 'Chrome 正在运行，要先关闭才能清理和改语言。现在帮你关闭 Chrome 吗？') -and (Stop-ChromeGracefully)) {
-            Write-Log 'Chrome 已关闭。'
+            Write-Note 'Chrome 正在运行；正式执行时会先把 Chrome 关闭。'
         } else {
-            Write-Note 'Chrome 还在运行，已跳过缓存和语言修改；请完全退出 Chrome（包括右下角托盘图标）后重试。'
-            return
+            Write-Log 'Chrome 正在运行，先把它关闭…'
+            if (Stop-Chrome) {
+                Write-Log 'Chrome 已关闭。'
+            } else {
+                Write-Fail 'Chrome 关不掉，已跳过缓存和语言修改；请手动完全退出 Chrome（包括右下角托盘图标）后重试。'
+                return
+            }
         }
     }
 
@@ -246,8 +329,7 @@ function Clear-Chrome {
             if ($DryRun) {
                 Write-Log "（演练）$($p.Name)\Preferences 的 Accept-Language 设为 en-US,en"
             } else {
-                try { Set-ChromeJson $prefs 'prefs' }
-                catch { Write-Fail "$($p.Name) Preferences 修改失败：$($_.Exception.Message)"; $langOk = $false }
+                if (-not (Set-ChromeJson $prefs 'prefs' "$($p.Name)\Preferences")) { $langOk = $false }
             }
         }
     }
@@ -258,8 +340,7 @@ function Clear-Chrome {
         if ($DryRun) {
             Write-Log '（演练）Local State 的界面语言设为 en-US'
         } else {
-            try { Set-ChromeJson $localState 'local' }
-            catch { Write-Fail "Local State 修改失败：$($_.Exception.Message)"; $langOk = $false }
+            if (-not (Set-ChromeJson $localState 'local' 'Local State')) { $langOk = $false }
         }
     }
 
@@ -276,7 +357,7 @@ function Test-AutoTz {
     try { return ((Get-ItemProperty -Path $TzAutoKey -Name Start -ErrorAction Stop).Start -ne 4) } catch { return $false }
 }
 
-function Test-TzOk { return ((Get-TimeZone).Id -eq $TargetTz -and -not (Test-AutoTz)) }
+function Test-TzOk { return ((Get-CurrentTz) -eq $TargetTz -and -not (Test-AutoTz)) }
 
 function Get-CurrentLang {
     try { return [string](Get-WinUserLanguageList)[0].LanguageTag } catch { return '' }
@@ -301,31 +382,61 @@ function Save-Snapshot {
     Write-Log "设置备份：$file"
 }
 
+function Get-CurrentTz { return (Invoke-Native { tzutil.exe /g }) }
+
 function Set-TargetTimezone {
     if (-not $script:DoTz) { return }
-    Write-Log "当前时区 $((Get-TimeZone).Id)，准备设置…"
+    Write-Log "当前时区 $(Get-CurrentTz)，准备设置…"
     if ($DryRun) {
-        Write-Log '（演练）关闭「自动设置时区」'
-        Write-Log "（演练）tzutil /s `"$TargetTz`""
+        Write-Log "（演练）依次尝试各种方式关闭「自动设置时区」并把时区改为 $TargetTzName，直到核对成功。"
         return
     }
-    # 先关掉「自动设置时区」，否则会被定位改回去。需要管理员权限。
-    try {
-        Set-ItemProperty -Path $TzAutoKey -Name Start -Value 4 -ErrorAction Stop
-        Stop-Service -Name tzautoupdate -Force -ErrorAction SilentlyContinue
-    } catch {
-        Write-Note "关闭「自动设置时区」失败（$($_.Exception.Message)），时区之后可能被系统改回去。"
-    }
-    $out = (& tzutil.exe /s $TargetTz 2>&1 | Out-String).Trim()
-    # 以实际结果为准，不能只看命令有没有报错。
+    # 先关掉「自动设置时区」，否则会被定位改回去。
+    $autoOff = Invoke-Methods '关闭「自动设置时区」' { -not (Test-AutoTz) } @(
+        { Set-ItemProperty -Path $TzAutoKey -Name Start -Value 4 -ErrorAction Stop },
+        { Invoke-Native { sc.exe config tzautoupdate start= disabled } },
+        { Invoke-Native { reg.exe add 'HKLM\SYSTEM\CurrentControlSet\Services\tzautoupdate' /v Start /t REG_DWORD /d 4 /f } }
+    )
+    Stop-Service -Name tzautoupdate -Force -ErrorAction SilentlyContinue
+
+    # 命令的返回值不可靠，每试一种方式都读回当前时区核对。
+    $tzSet = Invoke-Methods "时区改为 $TargetTzName" { (Get-CurrentTz) -eq $TargetTz } @(
+        { Invoke-Native { tzutil.exe /s $TargetTz } },
+        { Set-TimeZone -Id $TargetTz -ErrorAction Stop },
+        { Set-TimeZone -Name $TargetTz -ErrorAction Stop }
+    )
     [TimeZoneInfo]::ClearCachedData()
-    $now = (& tzutil.exe /g | Out-String).Trim()
-    if ($now -ne $TargetTz) {
-        Write-Fail "时区设置失败：当前仍是 $now。$out"
+    if (-not $tzSet) {
         Write-Note '可以手动改：设置 > 时间和语言 > 日期和时间，关掉「自动设置时区」，再选「(UTC-08:00) 太平洋时间(美国和加拿大)」。'
         return
     }
+    if (-not $autoOff) {
+        Write-Note '时区已经改好，但「自动设置时区」没关掉，之后可能被改回去；请到 设置 > 时间和语言 > 日期和时间 手动关闭。'
+        return
+    }
     Write-Log "时区已设为 $TargetTzName（$TargetTz）。"
+}
+
+# 语言列表里只剩 en-US 才算达标（这样输入法也只剩美式键盘）。
+function Test-LangOk {
+    $tags = @()
+    try { $tags = @(Get-WinUserLanguageList | ForEach-Object { $_.LanguageTag }) } catch { }
+    if ($tags.Count -eq 0) { $tags = @(Get-RegValue 'HKCU:\Control Panel\International\User Profile' 'Languages') }
+    return ($tags.Count -eq 1 -and $tags[0] -eq 'en-US')
+}
+
+# 显示语言：已生效的值或「下次登录生效」的值是 en-US 都算设置成功。
+function Test-UiLangOk {
+    $desk = 'HKCU:\Control Panel\Desktop'
+    $pending = @(Get-RegValue $desk 'PreferredUILanguagesPending')
+    if ($pending.Count -ge 1 -and $pending[0]) { return ($pending[0] -eq 'en-US') }
+    $now = @(Get-RegValue $desk 'PreferredUILanguages')
+    return ($now.Count -ge 1 -and $now[0] -eq 'en-US')
+}
+
+function Test-SystemLocaleOk {
+    if ((Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language' 'Default') -eq '0409') { return $true }
+    try { return ((Get-WinSystemLocale).Name -eq 'en-US') } catch { return $false }
 }
 
 function Set-TargetLanguage {
@@ -334,37 +445,63 @@ function Set-TargetLanguage {
     if ($DryRun) {
         Write-Log '（演练）语言列表改为只有 en-US（输入法只留美式键盘）'
         Write-Log '（演练）显示语言、区域格式、国家或地区、系统区域设置改为 en-US / 美国'
+        Write-Log '（演练）每一项先用系统命令改，不行再直接改注册表，改完逐项核对'
         return
     }
-    $steps = @(
-        @{ Name = '语言列表和键盘（只留 en-US）'; Run = { Set-WinUserLanguageList -LanguageList (New-WinUserLanguageList 'en-US') -Force -WarningAction SilentlyContinue } },
-        @{ Name = '显示语言'; Run = { Set-WinUILanguageOverride -Language 'en-US' } },
-        @{ Name = '区域格式'; Run = { Set-Culture -CultureInfo 'en-US' } },
-        @{ Name = '国家或地区'; Run = { Set-WinHomeLocation -GeoId 244 } },
-        @{ Name = '系统区域设置（需要管理员）'; Run = { Set-WinSystemLocale -SystemLocale 'en-US' } }
+    $intl = 'HKCU:\Control Panel\International'
+    $desk = 'HKCU:\Control Panel\Desktop'
+    $nls = 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls'
+    $results = @(
+        (Invoke-Methods '语言列表和键盘（只留 en-US）' { Test-LangOk } @(
+            { Set-WinUserLanguageList -LanguageList (New-WinUserLanguageList 'en-US') -Force -WarningAction SilentlyContinue -ErrorAction Stop },
+            {
+                New-Item -Path "$intl\User Profile" -Force | Out-Null
+                Set-ItemProperty -Path "$intl\User Profile" -Name Languages -Value ([string[]]@('en-US')) -Type MultiString -ErrorAction Stop
+            }
+        )),
+        (Invoke-Methods '显示语言' { Test-UiLangOk } @(
+            { Set-WinUILanguageOverride -Language 'en-US' -ErrorAction Stop },
+            { Set-ItemProperty -Path $desk -Name PreferredUILanguagesPending -Value ([string[]]@('en-US')) -Type MultiString -ErrorAction Stop },
+            { Set-ItemProperty -Path $desk -Name PreferredUILanguages -Value ([string[]]@('en-US')) -Type MultiString -ErrorAction Stop }
+        )),
+        (Invoke-Methods '区域格式' { (Get-RegValue $intl 'LocaleName') -eq 'en-US' } @(
+            { Set-Culture -CultureInfo 'en-US' -ErrorAction Stop },
+            { Set-ItemProperty -Path $intl -Name LocaleName -Value 'en-US' -ErrorAction Stop }
+        )),
+        (Invoke-Methods '国家或地区' { (Get-WinHomeLocation).GeoId -eq 244 } @(
+            { Set-WinHomeLocation -GeoId 244 -ErrorAction Stop },
+            {
+                Set-ItemProperty -Path "$intl\Geo" -Name Nation -Value '244' -ErrorAction Stop
+                Set-ItemProperty -Path "$intl\Geo" -Name Name -Value 'US' -ErrorAction Stop
+            }
+        )),
+        (Invoke-Methods '系统区域设置' { Test-SystemLocaleOk } @(
+            { Set-WinSystemLocale -SystemLocale 'en-US' -ErrorAction Stop },
+            {
+                Set-ItemProperty -Path "$nls\Language" -Name Default -Value '0409' -ErrorAction Stop
+                Set-ItemProperty -Path "$nls\CodePage" -Name ACP -Value '1252' -ErrorAction Stop
+                Set-ItemProperty -Path "$nls\CodePage" -Name OEMCP -Value '437' -ErrorAction Stop
+                Set-ItemProperty -Path "$nls\CodePage" -Name MACCP -Value '10000' -ErrorAction Stop
+            }
+        ))
     )
-    $ok = $true
-    foreach ($s in $steps) {
-        try { & $s.Run } catch { Write-Fail "$($s.Name) 设置失败：$($_.Exception.Message)"; $ok = $false }
-    }
     # Windows 11 才有：把设置同步到欢迎屏幕和新用户。没有这个命令不算错。
     if (Get-Command Copy-UserInternationalSettingsToSystem -ErrorAction SilentlyContinue) {
         try { Copy-UserInternationalSettingsToSystem -WelcomeScreen $true -NewUser $true } catch { }
     }
-    # 没装英文显示语言包的话，界面文字仍然是中文。
+    # 没装英文显示语言包的话，界面文字仍然是中文：有管理员权限就直接装上。
     if (Get-Command Get-InstalledLanguage -ErrorAction SilentlyContinue) {
         $hasEn = $false
         try { $hasEn = [bool](Get-InstalledLanguage -Language 'en-US' -ErrorAction Stop) } catch { }
         if (-not $hasEn) {
-            if (Confirm-Step '系统还没有安装英文显示语言包，界面文字会继续显示中文。现在下载安装吗（需要联网，可能要几分钟）？') {
-                try { Install-Language -Language 'en-US' | Out-Null; Write-Log '英文语言包已安装。' }
-                catch { Write-Fail "英文语言包安装失败：$($_.Exception.Message)" }
-            } else {
-                Write-Note '未安装英文语言包。需要时到 设置 > 时间和语言 > 语言和区域 添加 English (United States)。'
+            Write-Log '系统还没有英文显示语言包，正在下载安装（需要联网，可能要几分钟）…'
+            try { Install-Language -Language 'en-US' -ErrorAction Stop | Out-Null; Write-Log '英文语言包已安装。' }
+            catch {
+                Write-Note "英文语言包安装失败（$($_.Exception.Message)）。界面文字会继续显示中文；可到 设置 > 时间和语言 > 语言和区域 手动添加 English (United States)。"
             }
         }
     }
-    if ($ok) { Write-Log '语言 / 区域已设为 en-US，键盘只保留美式键盘；注销或重启后生效。' }
+    if ($results -notcontains $false) { Write-Log '语言 / 区域已设为 en-US，键盘只保留美式键盘；注销或重启后生效。' }
 }
 
 # ------------------------------------------------------- 安装 / 卸载 Claude
@@ -397,8 +534,8 @@ function Uninstall-Code {
         Write-Note 'winget 没有卸载成功（可能不是用 winget 装的）。'
     }
     if ((Get-Command npm -ErrorAction SilentlyContinue) -and -not $DryRun) {
-        & npm ls -g '@anthropic-ai/claude-code' *> $null
-        if ($LASTEXITCODE -eq 0) { & npm uninstall -g '@anthropic-ai/claude-code' }
+        Invoke-Native { npm ls -g '@anthropic-ai/claude-code' } | Out-Null
+        if ($LASTEXITCODE -eq 0) { Write-Log (Invoke-Native { npm uninstall -g '@anthropic-ai/claude-code' }) }
     }
     # 原生安装
     Remove-Safe (Join-Path $env:USERPROFILE '.local\bin\claude.exe') (Join-Path $env:USERPROFILE '.local\bin')
@@ -451,6 +588,49 @@ function Show-Status {
     Write-Host "  - Claude 数据目录：$ClaudeDir"
 }
 
+# 执行后逐项核对「选中的项目」有没有真的达到目标；没达到的记为未通过。
+function Show-Verify([bool]$WantCache, [bool]$WantHistory, [bool]$WantChrome, [bool]$WantTz, [bool]$WantLang) {
+    $failed = 0
+    Write-Host ''
+    Write-Host '执行后检查：'
+    if ($WantTz) {
+        if (Test-TzOk) { Write-Host "  √ 时区：$(Get-CurrentTz)，「自动设置时区」已关闭" }
+        else { Write-Host "  × 时区：当前是 $(Get-CurrentTz)，目标 $TargetTz（并且要关闭「自动设置时区」）" -ForegroundColor Red; $failed++ }
+    }
+    if ($WantLang) {
+        $bad = @()
+        if (-not (Test-LangOk)) { $bad += '语言列表' }
+        if (-not (Test-UiLangOk)) { $bad += '显示语言' }
+        if ((Get-RegValue 'HKCU:\Control Panel\International' 'LocaleName') -ne 'en-US') { $bad += '区域格式' }
+        if ((Get-WinHomeLocation).GeoId -ne 244) { $bad += '国家或地区' }
+        if (-not (Test-SystemLocaleOk)) { $bad += '系统区域设置' }
+        if ($bad.Count -eq 0) { Write-Host '  √ 系统语言 / 区域：en-US，键盘只剩美式键盘（注销或重启后完全生效）' }
+        else { Write-Host "  × 系统语言 / 区域：这些还不是 en-US：$($bad -join '、')" -ForegroundColor Red; $failed++ }
+    }
+    if ($WantChrome) {
+        if (-not (Test-Path -LiteralPath $ChromeData)) {
+            Write-Host '  - Chrome：这台电脑没有装 Chrome，无需处理'
+        } elseif (Test-ChromeRunning) {
+            Write-Host '  × Chrome：还在运行，没有彻底退出' -ForegroundColor Red; $failed++
+        } elseif ((Get-ChromeLang) -ne 'en-US') {
+            Write-Host "  × Chrome 语言：当前是 $(Get-ChromeLang)，目标 en-US" -ForegroundColor Red; $failed++
+        } else {
+            Write-Host '  √ Chrome：已彻底退出，缓存已清理，语言 en-US'
+        }
+    }
+    if ($WantCache) {
+        $left = @($script:ClaudeCacheItems | Where-Object { Test-Path -LiteralPath (Join-Path $ClaudeDir $_) }).Count
+        if ($left -eq 0) { Write-Host '  √ Claude Code 缓存：已清空' }
+        else { Write-Host "  × Claude Code 缓存：还有 $left 项没清掉" -ForegroundColor Red; $failed++ }
+    }
+    if ($WantHistory) {
+        $left = @($script:ClaudeHistoryItems | Where-Object { Test-Path -LiteralPath (Join-Path $ClaudeDir $_) }).Count
+        if ($left -eq 0) { Write-Host '  √ Claude Code 会话历史：已清空' }
+        else { Write-Host "  × Claude Code 会话历史：还有 $left 项没清掉" -ForegroundColor Red; $failed++ }
+    }
+    return $failed
+}
+
 function Invoke-Pipeline {
     if (-not ($script:DoCache -or $script:DoHistory -or $script:DoChrome -or $script:DoTz -or $script:DoLang)) {
         Write-Host '请至少选择一个执行项目。'; return
@@ -460,11 +640,14 @@ function Invoke-Pipeline {
     if ($script:DoHistory -and -not (Confirm-Step '会删除 Claude Code 的会话记录、自动记忆和提示词历史，无法恢复。确定继续？')) {
         $script:DoHistory = $false
     }
+    # 记下用户选了什么，最后按这个逐项核对。
+    $wantCache = $script:DoCache; $wantHistory = $script:DoHistory; $wantChrome = $script:DoChrome
+    $wantTz = $script:DoTz; $wantLang = $script:DoLang
+
     if ($script:DoTz -and -not $DryRun -and (Test-TzOk)) {
         Write-Log "时区已经是 $TargetTzName，无需修改。"
         $script:DoTz = $false
     }
-    $didLang = $script:DoLang
     if ($script:DoTz -or $script:DoLang) { Save-Snapshot }
 
     Set-TargetTimezone
@@ -472,14 +655,21 @@ function Invoke-Pipeline {
     Clear-Claude
     Clear-Chrome
 
-    if ($script:Errors -eq 0) { Write-Log "执行完成。共释放 $(Format-Size $script:FreedBytes)。" }
-    else { Write-Log "执行结束，有 $($script:Errors) 个错误，请看上面标了「失败」的行。" }
-    if (-not $DryRun) {
-        Write-Host ''
-        Write-Host '当前状态：'
-        Show-Status
-        if ($didLang) { Write-Host ''; Write-Log '提示：语言和键盘设置需要注销或重启 Windows 后才完全生效。' }
+    if ($DryRun) {
+        Write-Log "演练结束，没有做任何修改。预计可释放 $(Format-Size $script:FreedBytes)。"
+        return
     }
+    $failed = Show-Verify $wantCache $wantHistory $wantChrome $wantTz $wantLang
+    Write-Host ''
+    if ($failed -eq 0 -and $script:Errors -eq 0) {
+        Write-Log "全部完成，检查全部通过。共释放 $(Format-Size $script:FreedBytes)。"
+    } elseif ($failed -eq 0) {
+        Write-Log "选中的项目检查全部通过，但过程中有 $($script:Errors) 条报错，请看上面标了「失败」的行。共释放 $(Format-Size $script:FreedBytes)。"
+    } else {
+        Write-Log "有 $failed 项没有达到目标（上面标 × 的），原因请看标了「失败」的行。"
+        $script:Errors += $failed
+    }
+    if ($wantLang) { Write-Log '提示：语言和键盘设置需要注销或重启 Windows 后才完全生效。' }
 }
 
 function Show-Menu {
@@ -554,7 +744,7 @@ function Show-Usage {
   -All         等于 -Cache -Chrome -Timezone -Language（不含 -History）
   -DryRun      演练：只显示将要做的事，不做任何修改
   -Force       Claude Code 在运行时也继续清理
-  -Yes         不再逐项确认（Chrome 在运行时会直接帮你关闭）
+  -Yes         不再逐项确认
 
 脚本会自己弹出 UAC 申请管理员权限，不需要手动「以管理员身份运行」。
 "@
