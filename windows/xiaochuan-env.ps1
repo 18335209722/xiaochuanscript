@@ -46,7 +46,7 @@ $script:DoTz = $false
 $script:DoLang = $false
 $script:RemoveUserData = [bool]$RemoveData
 
-# ~.claude 下要清理的项目；执行后检查也用这两份清单。
+# ~.claude 下要清理的项目；执行结果也用这两份清单。
 $script:ClaudeCacheItems = 'cache', 'debug', 'paste-cache', 'image-cache', 'usage-data', 'feedback-bundles',
     'feedbackdrafts', 'shell-snapshots', 'session-env', 'plans', 'todos', 'statsig', 'logs',
     'sessions', 'seed-admin', 'downloads', 'skills.trash', 'plugins.trash',
@@ -58,6 +58,42 @@ function Write-Note([string]$Message) { Write-Host ("[{0}] 注意：{1}" -f (Get
 function Write-Fail([string]$Message) {
     Write-Host ("[{0}] 失败：{1}" -f (Get-Date -Format 'HH:mm:ss'), $Message) -ForegroundColor Red
     $script:Errors++
+    Add-Bad $Message
+}
+
+# ---------------------------------------------------------------- 结果汇总
+# 脚本结束前都会打印一份「执行结果」：完成的标绿色 √，没有完成的标红色 ×，
+# 最后一行用整条绿底 / 红底显示总结果。
+$script:Results = New-Object System.Collections.ArrayList
+$script:OkCount = 0
+$script:BadCount = 0
+function Add-Ok([string]$Text) { [void]$script:Results.Add([pscustomobject]@{ Kind = "ok"; Text = $Text }); $script:OkCount++ }
+function Add-Bad([string]$Text) { [void]$script:Results.Add([pscustomobject]@{ Kind = "bad"; Text = $Text }); $script:BadCount++ }
+function Add-Info([string]$Text) { [void]$script:Results.Add([pscustomobject]@{ Kind = "info"; Text = $Text }) }
+# 做完一件事：既显示一行日志，也记进最后的「执行结果」；演练时不算完成。
+function Write-Done([string]$Message) {
+    Write-Log $Message
+    if ($DryRun) { Add-Info "（演练，实际没有执行）$Message" } else { Add-Ok $Message }
+}
+# 跳过 / 取消：既显示一行日志，也记进最后的「执行结果」（不算完成，也不算失败）。
+function Write-Skip([string]$Message) { Write-Log $Message; Add-Info $Message }
+
+function Show-Result {
+    Write-Host ""
+    Write-Host "================ 执行结果 ================"
+    foreach ($r in $script:Results) {
+        if ($r.Kind -eq "ok") { Write-Host "  √ $($r.Text)" -ForegroundColor Green }
+        elseif ($r.Kind -eq "bad") { Write-Host "  × 没有完成：$($r.Text)" -ForegroundColor Red }
+        else { Write-Host "  - $($r.Text)" }
+    }
+    Write-Host "=========================================="
+    if ($script:BadCount -gt 0) {
+        Write-Host " 结果：有 $($script:BadCount) 行没有完成（上面标 × 的红色行） " -ForegroundColor White -BackgroundColor Red
+    } elseif ($script:OkCount -gt 0) {
+        Write-Host " 结果：全部完成 " -ForegroundColor White -BackgroundColor DarkGreen
+    } else {
+        Write-Host " 结果：没有做任何修改 " -ForegroundColor Black -BackgroundColor Gray
+    }
 }
 
 function Confirm-Step([string]$Question) {
@@ -525,16 +561,16 @@ function Invoke-Winget([string[]]$Arguments) {
 }
 
 function Install-Code {
-    if (-not (Confirm-Step '将用 winget 安装 Claude Code，是否继续？')) { Write-Log '已取消。'; return }
+    if (-not (Confirm-Step '将用 winget 安装 Claude Code，是否继续？')) { Write-Skip '已取消。'; return }
     if (Invoke-Winget @('install', '--id', 'Anthropic.ClaudeCode', '-e', '--accept-source-agreements', '--accept-package-agreements')) {
-        Write-Log 'Claude Code 安装完成。重新打开终端后输入 claude 使用。'
+        Write-Done 'Claude Code 安装完成。重新打开终端后输入 claude 使用。'
     } else { Write-Fail 'Claude Code 安装失败。' }
 }
 
 function Uninstall-Code {
     $msg = "将卸载 Claude Code，但保留 $ClaudeDir 配置和会话数据。确定继续？"
     if ($script:RemoveUserData) { $msg = "将卸载 Claude Code，并删除 $ClaudeDir 配置和会话数据。此操作不可恢复，确定继续？" }
-    if (-not (Confirm-Step $msg)) { Write-Log '已取消。'; return }
+    if (-not (Confirm-Step $msg)) { Write-Skip '已取消。'; return }
     if (-not $Force -and (Test-ClaudeRunning)) {
         Write-Fail 'Claude Code 正在运行。请先关闭所有 Claude Code 会话和终端（或加 -Force）。'; return
     }
@@ -551,26 +587,32 @@ function Uninstall-Code {
     if ($script:RemoveUserData) {
         Remove-Safe $ClaudeDir (Split-Path $ClaudeDir -Parent)
         Remove-Safe $ClaudeJson (Split-Path $ClaudeJson -Parent)
-        Write-Log 'Claude Code 已卸载。用户数据已删除。'
+        Write-Done 'Claude Code 已卸载。用户数据已删除。'
     } else {
-        Write-Log 'Claude Code 已卸载。配置和会话数据已保留。'
+        Write-Done 'Claude Code 已卸载。配置和会话数据已保留。'
     }
 }
 
 function Install-Desktop {
-    if (-not (Confirm-Step '将用 winget 安装 Claude Desktop，是否继续？')) { Write-Log '已取消。'; return }
+    if (-not (Confirm-Step '将用 winget 安装 Claude Desktop，是否继续？')) { Write-Skip '已取消。'; return }
     if (Invoke-Winget @('install', '--id', 'Anthropic.Claude', '-e', '--accept-source-agreements', '--accept-package-agreements')) {
-        Write-Log 'Claude Desktop 安装完成。'
+        Write-Done 'Claude Desktop 安装完成。'
     } else { Write-Fail 'Claude Desktop 安装失败。' }
 }
 
 function Uninstall-Desktop {
-    if (-not (Confirm-Step '将卸载 Claude Desktop。聊天记录和项目文件不会被删除。确定继续？')) { Write-Log '已取消。'; return }
-    if (Invoke-Winget @('uninstall', '--id', 'Anthropic.Claude', '-e')) { Write-Log 'Claude Desktop 已卸载。' }
+    if (-not (Confirm-Step '将卸载 Claude Desktop。聊天记录和项目文件不会被删除。确定继续？')) { Write-Skip '已取消。'; return }
+    if (Invoke-Winget @('uninstall', '--id', 'Anthropic.Claude', '-e')) { Write-Done 'Claude Desktop 已卸载。' }
     else { Write-Fail 'Claude Desktop 卸载失败。' }
 }
 
 # ----------------------------------------------------------------- 主流程
+
+# 状态里的一行：达标的绿色，没达标的红色并计数。
+function Write-StatusLine([string]$Mark, [string]$Text) {
+    if ($Mark -eq '√') { Write-Host "  √ $Text" -ForegroundColor Green }
+    else { Write-Host "  × $Text" -ForegroundColor Red; $script:StatusBad++ }
+}
 
 # 逐项显示当前状态，√ 表示已经符合目标，× 表示还需要处理。
 function Show-Status {
@@ -580,15 +622,16 @@ function Show-Status {
     if (Test-AutoTz) { $auto = '；「自动设置时区」开着，会被改回去'; $tzMark = '×' }
     $lang = Get-CurrentLang
     $langMark = if ($lang -eq 'en-US') { '√' } else { '×' }
-    Write-Host "  $tzMark 时区：$tz（目标 $TargetTz$auto）"
-    Write-Host "  $langMark 系统语言：$lang（目标 en-US）"
+    $script:StatusBad = 0
+    Write-StatusLine $tzMark "时区：$tz（目标 $TargetTz$auto）"
+    Write-StatusLine $langMark "系统语言：$lang（目标 en-US）"
     $cl = Get-ChromeLang
     if ($null -eq $cl) {
         Write-Host '  - Chrome：未检测到'
     } else {
         $clMark = if ($cl -eq 'en-US') { '√' } else { '×' }
         if (-not $cl) { $cl = '未设置，跟随系统' }
-        Write-Host "  $clMark Chrome 语言：$cl（目标 en-US）"
+        Write-StatusLine $clMark "Chrome 语言：$cl（目标 en-US）"
     }
     $code = if ((Get-Command claude -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $env:USERPROFILE '.local\bin\claude.exe'))) { '已安装' } else { '未安装' }
     $desktop = if (Test-Path (Join-Path $env:LOCALAPPDATA 'AnthropicClaude')) { '已安装' } else { '未检测到' }
@@ -599,11 +642,9 @@ function Show-Status {
 # 执行后逐项核对「选中的项目」有没有真的达到目标；没达到的记为未通过。
 function Show-Verify([bool]$WantCache, [bool]$WantHistory, [bool]$WantChrome, [bool]$WantTz, [bool]$WantLang) {
     $failed = 0
-    Write-Host ''
-    Write-Host '执行后检查：'
     if ($WantTz) {
-        if (Test-TzOk) { Write-Host "  √ 时区：$(Get-CurrentTz)，「自动设置时区」已关闭" }
-        else { Write-Host "  × 时区：当前是 $(Get-CurrentTz)，目标 $TargetTz（并且要关闭「自动设置时区」）" -ForegroundColor Red; $failed++ }
+        if (Test-TzOk) { Add-Ok "时区：$(Get-CurrentTz)，「自动设置时区」已关闭" }
+        else { Add-Bad "时区：当前是 $(Get-CurrentTz)，目标 $TargetTz（并且要关闭「自动设置时区」）"; $failed++ }
     }
     if ($WantLang) {
         $bad = @()
@@ -612,29 +653,29 @@ function Show-Verify([bool]$WantCache, [bool]$WantHistory, [bool]$WantChrome, [b
         if ((Get-RegValue 'HKCU:\Control Panel\International' 'LocaleName') -ne 'en-US') { $bad += '区域格式' }
         if ((Get-WinHomeLocation).GeoId -ne 244) { $bad += '国家或地区' }
         if (-not (Test-SystemLocaleOk)) { $bad += '系统区域设置' }
-        if ($bad.Count -eq 0) { Write-Host '  √ 系统语言 / 区域：en-US，键盘只剩美式键盘（注销或重启后完全生效）' }
-        else { Write-Host "  × 系统语言 / 区域：这些还不是 en-US：$($bad -join '、')" -ForegroundColor Red; $failed++ }
+        if ($bad.Count -eq 0) { Add-Ok '系统语言 / 区域：en-US，键盘只剩美式键盘（注销或重启后完全生效）' }
+        else { Add-Bad "系统语言 / 区域：这些还不是 en-US：$($bad -join '、')"; $failed++ }
     }
     if ($WantChrome) {
         if (-not (Test-Path -LiteralPath $ChromeData)) {
-            Write-Host '  - Chrome：这台电脑没有装 Chrome，无需处理'
+            Add-Info 'Chrome：这台电脑没有装 Chrome，无需处理'
         } elseif (Test-ChromeRunning) {
-            Write-Host '  × Chrome：还在运行，没有彻底退出' -ForegroundColor Red; $failed++
+            Add-Bad 'Chrome：还在运行，没有彻底退出'; $failed++
         } elseif ((Get-ChromeLang) -ne 'en-US') {
-            Write-Host "  × Chrome 语言：当前是 $(Get-ChromeLang)，目标 en-US" -ForegroundColor Red; $failed++
+            Add-Bad "Chrome 语言：当前是 $(Get-ChromeLang)，目标 en-US"; $failed++
         } else {
-            Write-Host '  √ Chrome：已彻底退出，缓存已清理，语言 en-US'
+            Add-Ok 'Chrome：已彻底退出，缓存已清理，语言 en-US'
         }
     }
     if ($WantCache) {
         $left = @($script:ClaudeCacheItems | Where-Object { Test-Path -LiteralPath (Join-Path $ClaudeDir $_) }).Count
-        if ($left -eq 0) { Write-Host '  √ Claude Code 缓存：已清空' }
-        else { Write-Host "  × Claude Code 缓存：还有 $left 项没清掉" -ForegroundColor Red; $failed++ }
+        if ($left -eq 0) { Add-Ok 'Claude Code 缓存：已清空' }
+        else { Add-Bad "Claude Code 缓存：还有 $left 项没清掉"; $failed++ }
     }
     if ($WantHistory) {
         $left = @($script:ClaudeHistoryItems | Where-Object { Test-Path -LiteralPath (Join-Path $ClaudeDir $_) }).Count
-        if ($left -eq 0) { Write-Host '  √ Claude Code 会话历史：已清空' }
-        else { Write-Host "  × Claude Code 会话历史：还有 $left 项没清掉" -ForegroundColor Red; $failed++ }
+        if ($left -eq 0) { Add-Ok 'Claude Code 会话历史：已清空' }
+        else { Add-Bad "Claude Code 会话历史：还有 $left 项没清掉"; $failed++ }
     }
     return $failed
 }
@@ -664,20 +705,14 @@ function Invoke-Pipeline {
     Clear-Chrome
 
     if ($DryRun) {
-        Write-Log "演练结束，没有做任何修改。预计可释放 $(Format-Size $script:FreedBytes)。"
+        Write-Skip "演练结束，没有做任何修改。预计可释放 $(Format-Size $script:FreedBytes)。"
         return
     }
+    # 逐项核对的结果记进「执行结果」，由调用的地方统一打印。
     $failed = Show-Verify $wantCache $wantHistory $wantChrome $wantTz $wantLang
-    Write-Host ''
-    if ($failed -eq 0 -and $script:Errors -eq 0) {
-        Write-Log "全部完成，检查全部通过。共释放 $(Format-Size $script:FreedBytes)。"
-    } elseif ($failed -eq 0) {
-        Write-Log "选中的项目检查全部通过，但过程中有 $($script:Errors) 条报错，请看上面标了「失败」的行。共释放 $(Format-Size $script:FreedBytes)。"
-    } else {
-        Write-Log "有 $failed 项没有达到目标（上面标 × 的），原因请看标了「失败」的行。"
-        $script:Errors += $failed
-    }
-    if ($wantLang) { Write-Log '提示：语言和键盘设置需要注销或重启 Windows 后才完全生效。' }
+    $script:Errors += $failed
+    Add-Info "共释放 $(Format-Size $script:FreedBytes)"
+    if ($wantLang) { Add-Info '提示：语言和键盘设置需要注销或重启 Windows 后才完全生效' }
 }
 
 function Show-Menu {
@@ -685,6 +720,7 @@ function Show-Menu {
         $script:DoCache = $false; $script:DoHistory = $false; $script:DoChrome = $false
         $script:DoTz = $false; $script:DoLang = $false
         $script:RemoveUserData = $false; $script:Errors = 0; $script:FreedBytes = [int64]0; $script:Removed = 0
+        $script:Results.Clear(); $script:OkCount = 0; $script:BadCount = 0
 
         Write-Host ''
         Write-Host "================ 小川环境助手 $Version（Windows）================"
@@ -725,6 +761,7 @@ function Show-Menu {
         elseif ($act -eq 'uninstall-desktop') { Uninstall-Desktop }
         elseif ($act -eq '' -and $picked) { Invoke-Pipeline }
         elseif ($act -eq '') { continue }
+        if ($act -ne 'none') { Show-Result }
 
         Write-Host ''
         if ((Read-Host '按回车返回菜单（输入 q 退出）') -eq 'q') { return }
@@ -783,6 +820,7 @@ if ($needAdmin -and -not (Test-Admin)) {
         exit 0
     } catch {
         Write-Fail '没有拿到管理员权限（UAC 被取消）。请重新运行，并在弹出的窗口里点「是」。'
+        Show-Result
         exit 1
     }
 }
@@ -790,25 +828,41 @@ if ($needAdmin -and -not (Test-Admin)) {
 # 用别的管理员账户通过 UAC 提权时，清理和语言会改到那个账户上，而不是当前登录的用户。
 if ($Elevated -and $OrigUser -and $OrigUser -ne $env:USERNAME) {
     Write-Fail "当前登录用户 $OrigUser 不是管理员，UAC 用的是另一个账户 $env:USERNAME，设置会改错账户。请用管理员账户登录 Windows 后再运行。"
+    Show-Result
     Read-Host '按回车关闭'
     exit 1
 }
 
+# 菜单里每执行完一次都会打印「执行结果」；其余情况在这里统一打印一次。
+$showResult = $true
 try {
     switch ($Action) {
-        'status' { Write-Host "小川环境助手 $Version（Windows）"; Show-Status }
+        'status' {
+            $showResult = $false
+            Write-Host "小川环境助手 $Version（Windows）"
+            Show-Status
+            Write-Host '=========================================='
+            if ($script:StatusBad -eq 0) {
+                Write-Host ' 结果：时区、语言都已达标 ' -ForegroundColor White -BackgroundColor DarkGreen
+            } else {
+                Write-Host " 结果：有 $($script:StatusBad) 项还没达标（上面标 × 的红色行） " -ForegroundColor White -BackgroundColor Red
+                $script:Errors += $script:StatusBad
+            }
+        }
         'install-code' { Install-Code }
         'uninstall-code' { Uninstall-Code }
         'install-desktop' { Install-Desktop }
         'uninstall-desktop' { Uninstall-Desktop }
         default {
             if ($script:DoCache -or $script:DoHistory -or $script:DoChrome -or $script:DoTz -or $script:DoLang) { Invoke-Pipeline }
-            else { Show-Menu }
+            else { $showResult = $false; Show-Menu }
         }
     }
 } catch {
     Write-Fail "脚本出错：$($_.Exception.Message)"
+    $showResult = $true
 }
+if ($showResult) { Show-Result }
 
 # 提权后是新开的窗口，结束前停一下，免得结果一闪而过。
 if ($Elevated -and ($Action -or $script:DoCache -or $script:DoHistory -or $script:DoChrome -or $script:DoTz -or $script:DoLang -or $script:Errors)) {

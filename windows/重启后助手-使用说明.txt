@@ -1,0 +1,59 @@
+小川重启后助手 · Windows 版 1.0.0 · 使用说明
+
+这是一个独立的脚本（after-reboot.bat + after-reboot.ps1，两个文件要放在同一个目录），
+和 xiaochuan-env.bat 互不影响。
+
+什么时候执行：
+  先用 xiaochuan-env.bat 改好时区、语言并重启电脑，重启之后再执行本脚本。
+
+作用（一次做两件事）：
+  1. Chrome 个人资料
+     新建一个「不登录 Google 账号」的 Chrome 个人资料，名字叫 claude，并用它打开 Chrome。
+     相当于手动点：Chrome 右上角头像 > 添加新的个人资料 > 保持未登录状态 > 起名 claude。
+     用户以前登录过的那个个人资料不会被改动或删除，只是不再用它打开。
+  2. Clash Verge Rev（https://github.com/clash-verge-rev/clash-verge-rev）
+     已经装了：不再安装（桌面上没有 Clash Verge 快捷方式的话，会补建一个）。
+     没有装：自动找到适合本机的最新版，下载、校验、安装，在桌面建快捷方式图标，然后打开。
+
+  两件事互不影响：前一件没成功，后一件照样会做。
+
+运行：
+  双击 after-reboot.bat               两件事都做
+  after-reboot.bat -Name 名字         Chrome 个人资料换一个名字（默认 claude）
+  after-reboot.bat -OnlyChrome        只做 Chrome 个人资料
+  after-reboot.bat -OnlyClash         只做 Clash Verge
+  after-reboot.bat -DryRun            演练：只显示将要做的事，不做任何修改
+  after-reboot.bat -Help              显示说明
+
+  不需要手动「以管理员身份运行」。只有需要安装 Clash Verge 时，Windows 会弹一次 UAC，点「是」。
+
+执行时能看到进度：
+  窗口里会显示「第 几/6 步」：
+    1 Chrome 个人资料
+    2 检查有没有装 Clash Verge   3 查找最新版   4 下载安装包   5 安装   6 建桌面快捷方式并打开
+  Clash Verge 已经装了的话，第 3～6 步会跳过。
+  下载时会显示进度条和百分比，开始下载前会显示安装包大小。
+
+执行结果：
+  执行的最后有一份「执行结果」：完成的项目是绿色 √；没有完成的项目用红色高亮，并写着「没有完成」。
+  最后一行是总结果：全部完成是绿底，有没完成的是红底，并写明有几行没有完成。
+
+Chrome 个人资料的说明：
+  - 第一次执行会新建个人资料；以后再执行不会重复新建，而是直接打开已经建好的那个。
+  - 新个人资料不登录任何账号，语言只有英文（en-US、en）。
+  - Chrome 会记住最后使用的个人资料，所以之后直接点 Chrome 图标也会进入 claude，
+    不会再回到以前登录的那个。想回去的话点 Chrome 右上角头像切换即可。
+  - Chrome 开着或关着都可以执行。
+
+Clash Verge 的说明：
+  - 会装哪个安装包（自动判断）：
+      普通电脑（x64）：Clash.Verge_版本_x64-setup.exe
+      ARM 电脑：       Clash.Verge_版本_arm64-setup.exe
+  - 先从 GitHub 官方地址下载；失败或太慢（连续 20 秒低于约 100KB/s）时自动换镜像；
+    都不行最后再回到官方地址慢慢下，断了会自动续传。
+  - 下载完会和 GitHub 官方公布的校验值（SHA-256）比对，一致才安装。
+    镜像不是官方的，所以镜像下载的文件必须校验一致才会用；拿不到官方校验值时不走镜像。
+  - 下载失败时会给出手动下载的地址。
+  - 安装是静默安装，不用一步步点「下一步」；静默安装没成功时会自动改为打开普通安装界面。
+  - 桌面快捷方式叫「Clash Verge」；桌面上已经有的话不会重复建。
+  - 本脚本只负责安装和打开，不会导入订阅，也不会改 Clash Verge 的任何设置。

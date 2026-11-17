@@ -60,9 +60,62 @@ NO_ROOT=0
 FREED_KB=0
 REMOVED=0
 
+# ---------------------------------------------------------------- 结果汇总
+# 每个脚本结束前都会打印一份「执行结果」：完成的标绿色 ✓，没有完成的标红色 ✗，
+# 最后一行用整条绿底 / 红底显示总结果。颜色只在终端里用，输出被重定向到文件时不带颜色码。
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_OK=$'\033[1;32m'; C_BAD=$'\033[1;31m'; C_OK_BAR=$'\033[1;97;42m'; C_BAD_BAR=$'\033[1;97;41m'
+    C_DIM_BAR=$'\033[1;30;47m'; C_OFF=$'\033[0m'
+else
+    C_OK=""; C_BAD=""; C_OK_BAR=""; C_BAD_BAR=""; C_DIM_BAR=""; C_OFF=""
+fi
+RESULTS=""      # 每行一条：种类<TAB>文字，种类是 ok / bad / info
+OK_COUNT=0
+BAD_COUNT=0
+ok_item() { RESULTS="${RESULTS}ok	$1
+"; OK_COUNT=$((OK_COUNT + 1)); }
+bad_item() { RESULTS="${RESULTS}bad	$1
+"; BAD_COUNT=$((BAD_COUNT + 1)); }
+info_item() { RESULTS="${RESULTS}info	$1
+"; }
+
+print_result() {
+    local kind text
+    echo
+    echo "================ 执行结果 ================"
+    while IFS='	' read -r kind text; do
+        case "$kind" in
+            ok) printf '  %s✓ %s%s\n' "$C_OK" "$text" "$C_OFF" ;;
+            bad) printf '  %s✗ 没有完成：%s%s\n' "$C_BAD" "$text" "$C_OFF" ;;
+            info) printf '  - %s\n' "$text" ;;
+        esac
+    done <<RESULT_EOF
+$RESULTS
+RESULT_EOF
+    echo "=========================================="
+    if [ "$BAD_COUNT" != "0" ]; then
+        printf '%s 结果：有 %s 行没有完成（上面标 ✗ 的红色行） %s\n' "$C_BAD_BAR" "$BAD_COUNT" "$C_OFF"
+    elif [ "$OK_COUNT" != "0" ]; then
+        printf '%s 结果：全部完成 %s\n' "$C_OK_BAR" "$C_OFF"
+    else
+        printf '%s 结果：没有做任何修改 %s\n' "$C_DIM_BAR" "$C_OFF"
+    fi
+}
+
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 warn() { printf '[%s] 注意：%s\n' "$(date +%H:%M:%S)" "$*" >&2; }
-fail() { printf '[%s] 失败：%s\n' "$(date +%H:%M:%S)" "$*" >&2; ERRORS=$((ERRORS + 1)); }
+fail() { printf '%s[%s] 失败：%s%s\n' "$C_BAD" "$(date +%H:%M:%S)" "$*" "$C_OFF" >&2; ERRORS=$((ERRORS + 1)); bad_item "$*"; }
+# 做完一件事：既显示一行日志，也记进最后的「执行结果」。
+done_ok() {
+    log "$*"
+    if [ "$DRY_RUN" = "1" ]; then
+        info_item "（演练，实际没有执行）$*"
+    else
+        ok_item "$*"
+    fi
+}
+# 跳过 / 取消 / 演练：既显示一行日志，也记进最后的「执行结果」（不算完成，也不算失败）。
+skip() { log "$*"; info_item "$*"; }
 
 confirm() {
     [ "$ASSUME_YES" = "1" ] && return 0
@@ -202,7 +255,7 @@ quit_chrome() {
 
 # ---------------------------------------------------------------- Claude Code
 
-# ~/.claude 下要清理的项目（名字里都没有空格）；执行后检查也用这两份清单。
+# ~/.claude 下要清理的项目（名字里都没有空格）；执行结果也用这两份清单。
 CLAUDE_CACHE_ITEMS="cache debug paste-cache image-cache usage-data feedback-bundles
 feedback/drafts shell-snapshots session-env plans todos statsig logs
 sessions seed-admin downloads skills/.trash plugins/.trash
@@ -700,17 +753,17 @@ set_language() {
 # ------------------------------------------------------- 安装 / 卸载 Claude
 
 install_code() {
-    confirm "将用官方脚本安装 Claude Code，是否继续？" || { log "已取消。"; return 0; }
+    confirm "将用官方脚本安装 Claude Code，是否继续？" || { skip "已取消。"; return 0; }
     if ! command -v curl >/dev/null 2>&1; then
         fail "需要 curl。"
         return 1
     fi
     if [ "$DRY_RUN" = "1" ]; then
-        log "（演练）curl -fsSL https://claude.ai/install.sh | bash"
+        skip "（演练）curl -fsSL https://claude.ai/install.sh | bash"
         return 0
     fi
     if curl -fsSL https://claude.ai/install.sh | bash; then
-        log "Claude Code 安装完成。"
+        done_ok "Claude Code 安装完成。"
     else
         fail "Claude Code 安装失败。"
     fi
@@ -721,7 +774,7 @@ uninstall_code() {
     if [ "$REMOVE_DATA" = "1" ]; then
         msg="将卸载 Claude Code，并删除 $CLAUDE_DIR 配置和会话数据。此操作不可恢复，确定继续？"
     fi
-    confirm "$msg" || { log "已取消。"; return 0; }
+    confirm "$msg" || { skip "已取消。"; return 0; }
     if [ "$FORCE" != "1" ] && claude_running; then
         fail "Claude Code 正在运行。请先关闭所有 Claude Code 会话和终端（或加 --force）。"
         return 1
@@ -740,24 +793,24 @@ uninstall_code() {
     if [ "$REMOVE_DATA" = "1" ]; then
         safe_rm "$CLAUDE_DIR" "$(dirname "$CLAUDE_DIR")"
         safe_rm "$CLAUDE_JSON" "$(dirname "$CLAUDE_JSON")"
-        log "Claude Code 已卸载。用户数据已删除。"
+        done_ok "Claude Code 已卸载。用户数据已删除。"
     else
-        log "Claude Code 已卸载。配置和会话数据已保留。"
+        done_ok "Claude Code 已卸载。配置和会话数据已保留。"
     fi
 }
 
 install_desktop() {
     if [ "$OS" != "mac" ]; then
-        warn "Claude Desktop 没有通用的 Linux 安装方式，已跳过。"
+        skip "Claude Desktop 没有通用的 Linux 安装方式，已跳过。"
         return 0
     fi
     if ! command -v brew >/dev/null 2>&1; then
-        warn "未找到 Homebrew。请到 https://claude.ai/download 下载安装包。"
+        skip "未找到 Homebrew。请到 https://claude.ai/download 下载安装包。"
         return 0
     fi
-    confirm "将用 Homebrew 安装 Claude Desktop，是否继续？" || { log "已取消。"; return 0; }
+    confirm "将用 Homebrew 安装 Claude Desktop，是否继续？" || { skip "已取消。"; return 0; }
     if run brew install --cask claude; then
-        log "Claude Desktop 安装完成。"
+        done_ok "Claude Desktop 安装完成。"
     else
         fail "Claude Desktop 安装失败。"
     fi
@@ -765,10 +818,10 @@ install_desktop() {
 
 uninstall_desktop() {
     if [ "$OS" != "mac" ]; then
-        warn "Linux 上没有 Claude Desktop 可卸载，已跳过。"
+        skip "Linux 上没有 Claude Desktop 可卸载，已跳过。"
         return 0
     fi
-    confirm "将卸载 Claude Desktop。聊天记录和项目文件不会被删除。确定继续？" || { log "已取消。"; return 0; }
+    confirm "将卸载 Claude Desktop。聊天记录和项目文件不会被删除。确定继续？" || { skip "已取消。"; return 0; }
     if command -v brew >/dev/null 2>&1 && brew list --cask claude >/dev/null 2>&1; then
         run brew uninstall --cask claude || fail "brew 卸载失败。"
     elif [ -d "/Applications/Claude.app" ]; then
@@ -779,13 +832,23 @@ uninstall_desktop() {
                 || fail "删除 /Applications/Claude.app 失败。"
         fi
     else
-        warn "未检测到 Claude Desktop。"
+        skip "未检测到 Claude Desktop。"
         return 0
     fi
-    log "Claude Desktop 已卸载。"
+    done_ok "Claude Desktop 已卸载。"
 }
 
 # ----------------------------------------------------------------- 主流程
+
+# 状态里的一行：$1 是 ✓ 或 ✗。达标的绿色，没达标的红色并计数。
+status_line() {
+    if [ "$1" = "✓" ]; then
+        printf '  %s✓ %s%s\n' "$C_OK" "$2" "$C_OFF"
+    else
+        printf '  %s✗ %s%s\n' "$C_BAD" "$2" "$C_OFF"
+        STATUS_BAD=$((STATUS_BAD + 1))
+    fi
+}
 
 # 逐项显示当前状态，✓ 表示已经符合目标，✗ 表示还需要处理。
 status() {
@@ -804,12 +867,13 @@ status() {
     fi
     case "$lang" in en-US*|en_US*) l_ok="✓" ;; esac
 
-    echo "  $t_ok 时区：${tz:-未知}（目标 $TARGET_TZ$auto）"
-    echo "  $l_ok 系统语言：${lang:-未知}（目标 en-US）"
+    STATUS_BAD=0
+    status_line "$t_ok" "时区：${tz:-未知}（目标 $TARGET_TZ$auto）"
+    status_line "$l_ok" "系统语言：${lang:-未知}（目标 en-US）"
     if [ -f "$CHROME_DATA/Local State" ]; then
         cl="$(chrome_lang)"
         [ "$cl" = "en-US" ] && c_ok="✓"
-        echo "  $c_ok Chrome 语言：${cl:-未设置，跟随系统}（目标 en-US）"
+        status_line "$c_ok" "Chrome 语言：${cl:-未设置，跟随系统}（目标 en-US）"
     else
         echo "  - Chrome：未检测到"
     fi
@@ -821,37 +885,35 @@ status() {
 verify_results() {
     local want_cache="$1" want_history="$2" want_chrome="$3" want_tz="$4" want_lang="$5"
     local item left cl
-    echo
-    echo "执行后检查："
     if [ "$want_tz" = "1" ]; then
         if tz_ok; then
-            echo "  ✓ 时区：$(current_tz)"
+            ok_item "时区：$(current_tz)"
         else
-            echo "  ✗ 时区：当前是 $(current_tz)，目标 $TARGET_TZ"
+            bad_item "时区：当前是 $(current_tz)，目标 $TARGET_TZ"
             VERIFY_FAILED=$((VERIFY_FAILED + 1))
         fi
     fi
     if [ "$want_lang" = "1" ]; then
         if lang_ok; then
-            echo "  ✓ 系统语言：$(current_lang)（注销或重启后完全生效）"
+            ok_item "系统语言：$(current_lang)（注销或重启后完全生效）"
         else
-            echo "  ✗ 系统语言：当前是 $(current_lang)，目标 en-US"
+            bad_item "系统语言：当前是 $(current_lang)，目标 en-US"
             VERIFY_FAILED=$((VERIFY_FAILED + 1))
         fi
     fi
     if [ "$want_chrome" = "1" ]; then
         if [ ! -d "$CHROME_DATA" ]; then
-            echo "  - Chrome：这台电脑没有装 Chrome，无需处理"
+            info_item "Chrome：这台电脑没有装 Chrome，无需处理"
         else
             cl="$(chrome_lang)"
             if chrome_running; then
-                echo "  ✗ Chrome：还在运行，没有彻底退出"
+                bad_item "Chrome：还在运行，没有彻底退出"
                 VERIFY_FAILED=$((VERIFY_FAILED + 1))
             elif [ "$cl" != "en-US" ]; then
-                echo "  ✗ Chrome 语言：当前是 ${cl:-未设置}，目标 en-US"
+                bad_item "Chrome 语言：当前是 ${cl:-未设置}，目标 en-US"
                 VERIFY_FAILED=$((VERIFY_FAILED + 1))
             else
-                echo "  ✓ Chrome：已彻底退出，缓存已清理，语言 en-US"
+                ok_item "Chrome：已彻底退出，缓存已清理，语言 en-US"
             fi
         fi
     fi
@@ -861,9 +923,9 @@ verify_results() {
             [ -e "$CLAUDE_DIR/$item" ] && left=$((left + 1))
         done
         if [ "$left" = "0" ]; then
-            echo "  ✓ Claude Code 缓存：已清空"
+            ok_item "Claude Code 缓存：已清空"
         else
-            echo "  ✗ Claude Code 缓存：还有 $left 项没清掉"
+            bad_item "Claude Code 缓存：还有 $left 项没清掉"
             VERIFY_FAILED=$((VERIFY_FAILED + 1))
         fi
     fi
@@ -873,9 +935,9 @@ verify_results() {
             [ -e "$CLAUDE_DIR/$item" ] && left=$((left + 1))
         done
         if [ "$left" = "0" ]; then
-            echo "  ✓ Claude Code 会话历史：已清空"
+            ok_item "Claude Code 会话历史：已清空"
         else
-            echo "  ✗ Claude Code 会话历史：还有 $left 项没清掉"
+            bad_item "Claude Code 会话历史：还有 $left 项没清掉"
             VERIFY_FAILED=$((VERIFY_FAILED + 1))
         fi
     fi
@@ -922,23 +984,17 @@ run_pipeline() {
     clean_chrome
 
     if [ "$DRY_RUN" = "1" ]; then
-        log "演练结束，没有做任何修改。预计可释放 $(human_kb "$FREED_KB")。"
+        skip "演练结束，没有做任何修改。预计可释放 $(human_kb "$FREED_KB")。"
         return 0
     fi
 
+    # 逐项核对的结果记进「执行结果」，由调用的地方统一打印。
     verify_results "$want_cache" "$want_history" "$want_chrome" "$want_tz" "$want_lang"
-    echo
-    if [ "$VERIFY_FAILED" = "0" ] && [ "$ERRORS" = "0" ]; then
-        log "全部完成，检查全部通过。共释放 $(human_kb "$FREED_KB")。"
-    elif [ "$VERIFY_FAILED" = "0" ]; then
-        log "选中的项目检查全部通过，但过程中有 $ERRORS 条报错，请看上面标了「失败」的行。共释放 $(human_kb "$FREED_KB")。"
-    else
-        log "有 $VERIFY_FAILED 项没有达到目标（上面标 ✗ 的），原因请看标了「失败」的行。"
-    fi
+    info_item "共释放 $(human_kb "$FREED_KB")"
     if [ "$want_lang" = "1" ]; then
-        log "提示：语言和键盘设置需要注销或重启电脑后才完全生效。"
+        info_item "提示：语言和键盘设置需要注销或重启电脑后才完全生效"
     fi
-    [ "$VERIFY_FAILED" = "0" ] && [ "$ERRORS" = "0" ]
+    [ "$BAD_COUNT" = "0" ]
 }
 
 menu() {
@@ -946,6 +1002,7 @@ menu() {
     while :; do
         DO_CACHE=0; DO_HISTORY=0; DO_CHROME=0; DO_TZ=0; DO_LANG=0
         REMOVE_DATA=0; ERRORS=0; FREED_KB=0; REMOVED=0
+        RESULTS=""; OK_COUNT=0; BAD_COUNT=0
         picked=0; act=""
 
         echo
@@ -1000,6 +1057,7 @@ menu() {
                     continue
                 fi ;;
         esac
+        [ "$act" = "none" ] || print_result
 
         echo
         printf '按回车返回菜单（输入 q 退出）：'
@@ -1061,15 +1119,30 @@ case "$ACTION" in
     uninstall-code) uninstall_code ;;
     install-desktop) install_desktop ;;
     uninstall-desktop) uninstall_desktop ;;
-    status) echo "小川环境助手 $VERSION（$OS）"; status ;;
+    status)
+        echo "小川环境助手 $VERSION（$OS）"
+        status
+        echo "=========================================="
+        if [ "$STATUS_BAD" = "0" ]; then
+            printf '%s 结果：时区、语言都已达标 %s\n' "$C_OK_BAR" "$C_OFF"
+        else
+            printf '%s 结果：有 %s 项还没达标（上面标 ✗ 的红色行） %s\n' "$C_BAD_BAR" "$STATUS_BAD" "$C_OFF"
+        fi
+        [ "$STATUS_BAD" = "0" ]
+        exit $?
+        ;;
     "")
         if [ "$DO_CACHE$DO_HISTORY$DO_CHROME$DO_TZ$DO_LANG" != "00000" ]; then
             run_pipeline
         elif [ -t 0 ]; then
+            # 菜单里每执行完一次都会打印「执行结果」，这里不用再打印。
             menu
+            exit 0
         else
             usage
             exit 2
         fi
         ;;
 esac
+print_result
+[ "$BAD_COUNT" = "0" ]
