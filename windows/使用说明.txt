@@ -1,0 +1,21 @@
+小川环境助手 · 使用说明
+
+运行：
+  双击 XiaochuanEnv.exe
+
+功能：
+  1. 清理 Claude Code 缓存、日志、临时文件
+  2. 可选清理 Claude Code 会话历史
+  3. 清理 Chrome 缓存，并把 Chrome 语言设为 en-US
+  4. 修改 Windows 时区为 America/Los_Angeles
+  5. 修改 Windows 语言/区域为 en-US
+  6. 安装 / 卸载 Claude Code 和 Claude Desktop
+
+注意：
+  - 修改时区、语言需要管理员权限，会弹 UAC；语言需要注销或重启 Windows 后生效。
+  - Chrome 必须完全退出，否则 Chrome 缓存和语言会跳过。
+  - Chrome 只清缓存子目录，不删除书签、密码、登录状态。
+  - Claude Code 卸载默认保留配置和会话数据；只有勾选“同时删除配置和会话数据”才会删除。
+  - Claude Desktop 卸载不会删除聊天记录和项目文件。
+  - Claude 安装/卸载需要 Windows 自带的 winget。
+  - 不会删除中文语言包。
