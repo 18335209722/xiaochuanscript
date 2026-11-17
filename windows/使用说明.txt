@@ -1,21 +1,47 @@
-小川环境助手 · 使用说明
+小川环境助手 · Windows 版 · 使用说明
 
-运行：
-  双击 XiaochuanEnv.exe
+这个目录里有两种用法，功能相同，任选其一：
+  A. XiaochuanEnv.exe（1.0.0，图形界面）：双击运行。
+  B. xiaochuan-env.bat + xiaochuan-env.ps1（1.1.0，脚本版）：两个文件要放在同一个目录。
+
+脚本版运行：
+  双击 xiaochuan-env.bat                     交互菜单（输入 a 一键执行）
+  xiaochuan-env.bat -All                     直接执行：清缓存 + Chrome + 时区 + 语言
+  xiaochuan-env.bat -All -DryRun             演练，只显示将要做的事
+  xiaochuan-env.bat status                   检查当前状态
+  xiaochuan-env.bat -Help                    全部参数
+
+  脚本会自己弹出 UAC 申请管理员权限（只弹一次，之后所有操作都在管理员权限下执行），
+  不需要手动「以管理员身份运行」。当前登录的 Windows 账户必须本身是管理员。
 
 功能：
   1. 清理 Claude Code 缓存、日志、临时文件
   2. 可选清理 Claude Code 会话历史
   3. 清理 Chrome 缓存，并把 Chrome 语言设为 en-US
-  4. 修改 Windows 时区为 America/Los_Angeles
-  5. 修改 Windows 语言/区域为 en-US
+  4. 修改 Windows 时区为 America/Los_Angeles（太平洋时间）
+  5. 修改 Windows 语言/区域为 en-US，键盘只留美式键盘
   6. 安装 / 卸载 Claude Code 和 Claude Desktop
+
+脚本版的状态检查：
+  菜单顶部和每次执行结束后都会显示当前状态：
+    √ 表示这一项已经达标，× 表示还没达标。
+  时区这一项只有「时区正确」并且「自动设置时区」已关闭才算 √。
 
 注意：
   - 修改时区、语言需要管理员权限，会弹 UAC；语言需要注销或重启 Windows 后生效。
-  - Chrome 必须完全退出，否则 Chrome 缓存和语言会跳过。
+  - 脚本版会同时关闭「自动设置时区」，改完后核对实际结果，没改成会明确报「失败」。
+  - 系统区域设置改成 en-US 后，个别老的中文软件可能显示乱码；
+    需要时到 控制面板 > 区域 > 管理 > 更改系统区域设置 改回中文。
+  - 如果系统没有安装英文显示语言包，脚本版会询问是否下载安装；不装的话界面文字仍是中文。
+  - Chrome 必须完全退出，否则 Chrome 缓存和语言会跳过。脚本版会询问是否帮你关闭 Chrome。
   - Chrome 只清缓存子目录，不删除书签、密码、登录状态。
-  - Claude Code 卸载默认保留配置和会话数据；只有勾选“同时删除配置和会话数据”才会删除。
+  - Claude Code 卸载默认保留配置和会话数据；只有勾选“同时删除配置和会话数据”
+    （脚本版是加 -RemoveData）才会删除。
   - Claude Desktop 卸载不会删除聊天记录和项目文件。
   - Claude 安装/卸载需要 Windows 自带的 winget。
   - 不会删除中文语言包。
+
+脚本版备份位置：
+  %USERPROFILE%\.xiaochuan-env\backups\<时间>\
+    chrome-files\           修改前的 Chrome Local State 和 Preferences
+    settings-snapshot.txt   修改前的时区、语言和输入法

@@ -5,7 +5,7 @@
 #   时区改为 America/Los_Angeles、系统语言改为 en-US、安装 / 卸载 Claude。
 # 兼容 macOS 自带的 bash 3.2：不使用关联数组、mapfile、${var,,} 等新语法。
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 TARGET_TZ="America/Los_Angeles"
 
 case "$(uname -s)" in
@@ -13,6 +13,14 @@ case "$(uname -s)" in
     Linux) OS="linux" ;;
     *) echo "只支持 macOS 和 Linux。" >&2; exit 1 ;;
 esac
+
+# 用 sudo 整个运行会把缓存清理、语言、键盘这些「用户级」操作做到 root 账户上，
+# 还会把家目录里的文件变成 root 所有。所以这里退回原用户身份重新执行，
+# 真正需要管理员权限的步骤（时区等）由脚本自己逐条 sudo；密码刚输过，不会再问。
+if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && [ -f "$0" ]; then
+    echo "检测到用 sudo 运行：改回用户 $SUDO_USER 的身份执行，需要管理员权限的步骤会自动提权。"
+    exec sudo -u "$SUDO_USER" -H -- bash "$0" "$@"
+fi
 
 DATA_DIR="$HOME/.xiaochuan-env"
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -143,6 +151,27 @@ chrome_running() {
     fi
 }
 
+wait_chrome_exit() {
+    local i=0
+    while chrome_running && [ "$i" -lt 10 ]; do
+        sleep 1
+        i=$((i + 1))
+    done
+    ! chrome_running
+}
+
+# 正常退出 Chrome（等同于菜单里点「退出」，标签页下次可以恢复）。
+quit_chrome() {
+    if [ "$OS" = "mac" ]; then
+        osascript -e 'tell application "Google Chrome" to quit' >/dev/null 2>&1
+        wait_chrome_exit && return 0
+        pkill -TERM -x "Google Chrome" >/dev/null 2>&1
+    else
+        pkill -TERM -x chrome >/dev/null 2>&1
+    fi
+    wait_chrome_exit
+}
+
 # ---------------------------------------------------------------- Claude Code
 
 clean_claude() {
@@ -227,8 +256,14 @@ clean_chrome() {
         return 0
     fi
     if chrome_running; then
-        warn "Chrome 正在运行，已跳过缓存和语言修改；请完全退出 Chrome 后重试。"
-        return 0
+        if [ "$DRY_RUN" = "1" ]; then
+            warn "Chrome 正在运行；正式执行时会先询问是否帮你退出 Chrome。"
+        elif confirm "Chrome 正在运行，要先退出才能清理和改语言。现在帮你退出 Chrome 吗？" && quit_chrome; then
+            log "Chrome 已退出。"
+        else
+            warn "Chrome 还在运行，已跳过缓存和语言修改；请完全退出 Chrome 后重试。"
+            return 0
+        fi
     fi
 
     local before_kb="$FREED_KB" before_n="$REMOVED" profiles=0 profile name sub
@@ -300,6 +335,47 @@ current_tz() {
     fi
 }
 
+# macOS「自动设置时区」开关：1 开，0 关，空表示读不到。
+auto_tz() {
+    defaults read /Library/Preferences/com.apple.timezone.auto Active 2>/dev/null
+}
+
+# 时区已经达标（mac 上还要求「自动设置时区」是关的）。
+tz_ok() {
+    [ "$(current_tz)" = "$TARGET_TZ" ] || return 1
+    if [ "$OS" = "mac" ] && [ "$(auto_tz)" = "1" ]; then
+        return 1
+    fi
+    return 0
+}
+
+# 系统当前配置的语言（不是当前终端的 LANG）。
+current_lang() {
+    local f v=""
+    if [ "$OS" = "mac" ]; then
+        defaults read -g AppleLanguages 2>/dev/null | sed -n '2p' | tr -d ' ",'
+        return 0
+    fi
+    for f in /etc/default/locale /etc/locale.conf; do
+        [ -r "$f" ] || continue
+        v="$(sed -n 's/^LANG=//p' "$f" | tr -d '"' | tail -n 1)"
+        [ -n "$v" ] && break
+    done
+    echo "${v:-${LANG:-}}"
+}
+
+# Chrome 界面语言（Local State 里的 intl.app_locale），没设置过则输出空。
+chrome_lang() {
+    [ -f "$CHROME_DATA/Local State" ] || return 0
+    perl -MJSON::PP -e '
+        local $/;
+        open(my $in, "<", $ARGV[0]) or exit 0;
+        my $d = eval { JSON::PP->new->utf8->decode(<$in>) };
+        exit 0 unless ref($d) eq "HASH" && ref($d->{intl}) eq "HASH";
+        print $d->{intl}{app_locale} if defined $d->{intl}{app_locale};
+    ' "$CHROME_DATA/Local State" 2>/dev/null
+}
+
 snapshot_settings() {
     [ "$DRY_RUN" = "1" ] && return 0
     mkdir -p "$BACKUP_DIR" || return 0
@@ -331,7 +407,7 @@ snapshot_settings() {
 set_timezone() {
     [ "$DO_TZ" = "1" ] || return 0
     log "当前时区 $(current_tz)，准备设置…"
-    local out=""
+    local out="" zone=""
     if [ "$OS" = "mac" ]; then
         # 先关掉「自动设置时区」，否则会被定位改回去。
         run_root defaults write /Library/Preferences/com.apple.timezone.auto Active -bool false \
@@ -343,7 +419,9 @@ set_timezone() {
             out="$(run_root systemsetup -settimezone "$TARGET_TZ" 2>&1)"
             if [ "$(current_tz)" != "$TARGET_TZ" ]; then
                 # systemsetup 在部分系统上被限制，退回直接改链接。
-                run_root ln -sf "/var/db/timezone/zoneinfo/$TARGET_TZ" /etc/localtime
+                zone="/var/db/timezone/zoneinfo/$TARGET_TZ"
+                [ -e "$zone" ] || zone="/usr/share/zoneinfo/$TARGET_TZ"
+                run_root ln -sf "$zone" /etc/localtime
             fi
         fi
     elif command -v timedatectl >/dev/null 2>&1; then
@@ -363,9 +441,15 @@ set_timezone() {
     if [ "$(current_tz)" != "$TARGET_TZ" ]; then
         fail "时区设置失败：当前仍是 $(current_tz)。"
         [ -n "$out" ] && printf '%s\n' "$out" >&2
+        if [ "$OS" = "mac" ]; then
+            warn "可以手动改：系统设置 > 通用 > 日期与时间，关掉「自动设置时区」，再选洛杉矶。"
+        fi
         return 1
     fi
-    log "时区已设为 $TARGET_TZ。"
+    if [ "$OS" = "mac" ] && [ "$(auto_tz)" = "1" ]; then
+        warn "「自动设置时区」没有关掉，时区之后可能被改回去；请到 系统设置 > 通用 > 日期与时间 手动关闭。"
+    fi
+    log "时区已设为 $TARGET_TZ，现在是 $(date '+%Y-%m-%d %H:%M %Z')。"
 }
 
 set_language_mac() {
@@ -547,15 +631,34 @@ uninstall_desktop() {
 
 # ----------------------------------------------------------------- 主流程
 
+# 逐项显示当前状态，✓ 表示已经符合目标，✗ 表示还需要处理。
 status() {
-    local code="未安装" desktop="未安装"
+    local code="未安装" desktop="未安装" tz lang cl t_ok="✗" l_ok="✗" c_ok="✗" auto=""
     command -v claude >/dev/null 2>&1 && code="已安装"
     [ -x "$HOME/.local/bin/claude" ] && code="已安装"
     [ "$OS" = "mac" ] && [ -d "/Applications/Claude.app" ] && desktop="已安装"
     [ "$OS" = "linux" ] && desktop="不适用"
-    echo "系统：$OS    时区：$(current_tz)    语言：${LANG:-未设置}"
-    echo "Claude Code：$code    Claude Desktop：$desktop"
-    echo "Claude 数据目录：$CLAUDE_DIR"
+
+    tz="$(current_tz)"
+    lang="$(current_lang)"
+    [ "$tz" = "$TARGET_TZ" ] && t_ok="✓"
+    if [ "$OS" = "mac" ] && [ "$(auto_tz)" = "1" ]; then
+        auto="；「自动设置时区」开着，会被改回去"
+        t_ok="✗"
+    fi
+    case "$lang" in en-US*|en_US*) l_ok="✓" ;; esac
+
+    echo "  $t_ok 时区：${tz:-未知}（目标 $TARGET_TZ$auto）"
+    echo "  $l_ok 系统语言：${lang:-未知}（目标 en-US）"
+    if [ -f "$CHROME_DATA/Local State" ]; then
+        cl="$(chrome_lang)"
+        [ "$cl" = "en-US" ] && c_ok="✓"
+        echo "  $c_ok Chrome 语言：${cl:-未设置，跟随系统}（目标 en-US）"
+    else
+        echo "  - Chrome：未检测到"
+    fi
+    echo "  - Claude Code：$code    Claude Desktop：$desktop"
+    echo "  - Claude 数据目录：$CLAUDE_DIR"
 }
 
 run_pipeline() {
@@ -563,78 +666,125 @@ run_pipeline() {
         echo "请至少选择一个执行项目。"
         return 1
     fi
+    STAMP="$(date +%Y%m%d-%H%M%S)"
+    BACKUP_DIR="$DATA_DIR/backups/$STAMP"
+    local need_root=0 want_lang="$DO_LANG"
+
     [ "$DRY_RUN" = "1" ] && log "演练模式：只显示将要做的事，不做任何修改。"
     if [ "$DO_HISTORY" = "1" ]; then
         confirm "会删除 Claude Code 的会话记录、自动记忆和提示词历史，无法恢复。确定继续？" || DO_HISTORY=0
     fi
+    if [ "$DO_TZ" = "1" ] && [ "$DRY_RUN" != "1" ] && tz_ok; then
+        log "时区已经是 $TARGET_TZ，无需修改。"
+        DO_TZ=0
+    fi
+
     if [ "$DO_TZ" = "1" ] || [ "$DO_LANG" = "1" ]; then
+        # mac 的语言 / 键盘是用户级设置，不需要 root；时区、Linux 的语言需要。
+        [ "$DO_TZ" = "1" ] && need_root=1
+        [ "$DO_LANG" = "1" ] && [ "$OS" != "mac" ] && need_root=1
         # 先一次性拿到管理员权限，拿不到就明说，不要等到后面静默失败。
-        # mac 的语言 / 键盘是用户级设置，不需要 root；Linux 两项都需要。
-        if [ "$DRY_RUN" != "1" ] && [ "$(id -u)" != "0" ]; then
-            if [ "$DO_TZ" = "1" ] || [ "$OS" != "mac" ]; then
-                log "修改时区 / 语言需要管理员权限，请输入本机登录密码（输入时不显示）。"
-                if ! sudo -v; then
-                    fail "没有拿到管理员权限（密码不对，或当前账户不是管理员），跳过需要管理员权限的项目。"
-                    DO_TZ=0
-                    [ "$OS" = "mac" ] || DO_LANG=0
-                fi
+        if [ "$need_root" = "1" ] && [ "$DRY_RUN" != "1" ] && [ "$(id -u)" != "0" ]; then
+            log "修改时区 / 语言需要管理员权限，请输入本机登录密码（输入时屏幕上不显示，输完按回车）。"
+            if ! command -v sudo >/dev/null 2>&1 || ! sudo -v; then
+                fail "没有拿到管理员权限（密码不对，或当前账户不是管理员），已跳过需要管理员权限的项目。"
+                DO_TZ=0
+                [ "$OS" = "mac" ] || DO_LANG=0
             fi
         fi
         if [ "$DO_TZ" = "1" ] || [ "$DO_LANG" = "1" ]; then
             snapshot_settings
         fi
     fi
-    clean_claude
-    clean_chrome
+
+    # 先做需要管理员权限的两项，免得清理耗时太久导致 sudo 授权过期。
     set_timezone
     set_language
+    clean_claude
+    clean_chrome
+
     if [ "$ERRORS" = "0" ]; then
         log "执行完成。共释放 $(human_kb "$FREED_KB")。"
     else
-        log "执行结束，有 $ERRORS 个错误。"
+        log "执行结束，有 $ERRORS 个错误，请看上面标了「失败」的行。"
     fi
-    if [ "$DO_LANG" = "1" ]; then
-        log "提示：语言设置需要注销或重启后完全生效。"
+    if [ "$DRY_RUN" != "1" ]; then
+        echo
+        echo "当前状态："
+        status
+    fi
+    if [ "$want_lang" = "1" ] && [ "$DO_LANG" = "1" ] && [ "$DRY_RUN" != "1" ]; then
+        echo
+        log "提示：语言和键盘设置需要注销或重启电脑后才完全生效。"
     fi
     [ "$ERRORS" = "0" ]
 }
 
 menu() {
-    echo "小川环境助手 $VERSION（$OS）"
-    status
-    echo
-    echo "  1) 清理 Claude Code 缓存、日志、临时文件"
-    echo "  2) 清理 Claude Code 会话历史（不可恢复）"
-    echo "  3) 清理 Chrome 缓存，并把 Chrome 语言设为 en-US"
-    echo "  4) 时区改为 $TARGET_TZ"
-    echo "  5) 系统语言 / 区域改为 en-US，键盘布局只留美式键盘"
-    echo "  a) 执行 1 3 4 5"
-    echo "  i) 安装 Claude Code        u) 卸载 Claude Code"
-    echo "  I) 安装 Claude Desktop     U) 卸载 Claude Desktop"
-    echo "  q) 退出"
-    echo
-    printf '请输入要执行的项目（可多选，用空格分开，例如 1 3 4）：'
-    read -r choices || exit 0
-    local c picked=0
-    for c in $choices; do
-        case "$c" in
-            1) DO_CACHE=1; picked=1 ;;
-            2) DO_HISTORY=1; picked=1 ;;
-            3) DO_CHROME=1; picked=1 ;;
-            4) DO_TZ=1; picked=1 ;;
-            5) DO_LANG=1; picked=1 ;;
-            a|A) DO_CACHE=1; DO_CHROME=1; DO_TZ=1; DO_LANG=1; picked=1 ;;
-            i) install_code; return ;;
-            u)
+    local c picked act choices
+    while :; do
+        DO_CACHE=0; DO_HISTORY=0; DO_CHROME=0; DO_TZ=0; DO_LANG=0
+        REMOVE_DATA=0; ERRORS=0; FREED_KB=0; REMOVED=0
+        picked=0; act=""
+
+        echo
+        echo "================ 小川环境助手 $VERSION（$OS）================"
+        status
+        echo
+        echo "  1) 清理 Claude Code 缓存、日志、临时文件"
+        echo "  2) 清理 Claude Code 会话历史（不可恢复）"
+        echo "  3) 清理 Chrome 缓存，并把 Chrome 语言设为 en-US"
+        echo "  4) 时区改为 $TARGET_TZ"
+        echo "  5) 系统语言 / 区域改为 en-US，键盘布局只留美式键盘"
+        echo "  a) 一键执行 1 3 4 5（推荐）"
+        echo "  i) 安装 Claude Code        u) 卸载 Claude Code"
+        echo "  I) 安装 Claude Desktop     U) 卸载 Claude Desktop"
+        echo "  q) 退出"
+        echo
+        printf '请输入要执行的项目（可多选，用空格分开，例如 1 3 4），然后按回车：'
+        read -r choices || exit 0
+
+        # 允许用逗号分隔；关掉通配符展开，免得输入 * 之类被当成文件名。
+        set -f
+        # shellcheck disable=SC2086
+        set -- $(printf '%s' "$choices" | tr ',' ' ')
+        set +f
+        for c in "$@"; do
+            case "$c" in
+                1) DO_CACHE=1; picked=1 ;;
+                2) DO_HISTORY=1; picked=1 ;;
+                3) DO_CHROME=1; picked=1 ;;
+                4) DO_TZ=1; picked=1 ;;
+                5) DO_LANG=1; picked=1 ;;
+                a|A) DO_CACHE=1; DO_CHROME=1; DO_TZ=1; DO_LANG=1; picked=1 ;;
+                i) act="install_code" ;;
+                u) act="uninstall_code" ;;
+                I) act="install_desktop" ;;
+                U) act="uninstall_desktop" ;;
+                q|Q) exit 0 ;;
+                *) echo "看不懂的选项：$c"; act="none"; break ;;
+            esac
+        done
+
+        case "$act" in
+            none) ;;
+            uninstall_code)
                 if confirm "同时删除配置和会话数据？"; then REMOVE_DATA=1; fi
-                uninstall_code; return ;;
-            I) install_desktop; return ;;
-            U) uninstall_desktop; return ;;
-            q|Q) exit 0 ;;
-            *) echo "看不懂的选项：$c"; exit 1 ;;
+                uninstall_code ;;
+            install_code|install_desktop|uninstall_desktop) "$act" ;;
+            "")
+                if [ "$picked" = "1" ]; then
+                    run_pipeline
+                else
+                    continue
+                fi ;;
         esac
+
+        echo
+        printf '按回车返回菜单（输入 q 退出）：'
+        read -r c || exit 0
+        case "$c" in q|Q) exit 0 ;; esac
     done
-    [ "$picked" = "1" ] && run_pipeline
 }
 
 usage() {
@@ -642,13 +792,13 @@ usage() {
 小川环境助手 $VERSION（macOS / Linux）
 
 用法：
-  $0                       交互菜单
-  $0 [选项]                按选项直接执行
-  $0 install-code          安装 Claude Code
-  $0 uninstall-code [--remove-data]
-  $0 install-desktop       安装 Claude Desktop（仅 macOS）
-  $0 uninstall-desktop     卸载 Claude Desktop（仅 macOS）
-  $0 status                查看当前状态
+  bash $0                  交互菜单（不带参数）
+  bash $0 [选项]           按选项直接执行
+  bash $0 status           检查当前状态（时区 / 语言 / Chrome 是否已达标）
+  bash $0 install-code     安装 Claude Code
+  bash $0 uninstall-code [--remove-data]
+  bash $0 install-desktop  安装 Claude Desktop（仅 macOS）
+  bash $0 uninstall-desktop
 
 选项：
   --cache        清理 Claude Code 缓存、日志、临时文件
@@ -659,8 +809,10 @@ usage() {
   --all          等于 --cache --chrome --timezone --language（不含 --history）
   --dry-run      演练：只显示将要做的事，不做任何修改
   --force        Claude Code 在运行时也继续清理
-  -y, --yes      不再逐项确认
+  -y, --yes      不再逐项确认（Chrome 在运行时会直接帮你退出）
   -h, --help     显示本说明
+
+不要在前面加 sudo：脚本会在需要时自己申请管理员权限，只要输一次密码。
 EOF
 }
 
@@ -688,14 +840,15 @@ case "$ACTION" in
     uninstall-code) uninstall_code ;;
     install-desktop) install_desktop ;;
     uninstall-desktop) uninstall_desktop ;;
-    status) status ;;
+    status) echo "小川环境助手 $VERSION（$OS）"; status ;;
     "")
-        if [ "$DO_CACHE$DO_HISTORY$DO_CHROME$DO_TZ$DO_LANG" = "00000" ]; then
+        if [ "$DO_CACHE$DO_HISTORY$DO_CHROME$DO_TZ$DO_LANG" != "00000" ]; then
+            run_pipeline
+        elif [ -t 0 ]; then
             menu
         else
-            run_pipeline
+            usage
+            exit 2
         fi
         ;;
 esac
-
-[ "$ERRORS" = "0" ]

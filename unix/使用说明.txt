@@ -1,11 +1,18 @@
-小川环境助手 · macOS / Linux 版 · 使用说明
+小川环境助手 · macOS / Linux 版 1.1.0 · 使用说明
 
 运行（macOS 和 Linux 是同一个脚本，会自动识别系统）：
-  chmod +x xiaochuan-env.sh
-  ./xiaochuan-env.sh              交互菜单
-  ./xiaochuan-env.sh --all        直接执行：清缓存 + Chrome + 时区 + 语言
-  ./xiaochuan-env.sh --all --dry-run   演练，只显示将要做的事
-  ./xiaochuan-env.sh --help       全部参数
+  macOS：在访达里双击 xiaochuan-env.command 即可打开菜单。
+         第一次如果提示「无法打开」，右键点它 > 打开；
+         如果提示没有权限，在终端执行一次：chmod +x xiaochuan-env.command
+  终端：
+    bash xiaochuan-env.sh                    交互菜单（输入 a 一键执行）
+    bash xiaochuan-env.sh --all              直接执行：清缓存 + Chrome + 时区 + 语言
+    bash xiaochuan-env.sh --all --dry-run    演练，只显示将要做的事
+    bash xiaochuan-env.sh status             检查当前状态
+    bash xiaochuan-env.sh --help             全部参数
+
+  不要在前面加 sudo。脚本会在需要时自己申请管理员权限，只要输一次本机登录密码
+  （输入时屏幕上不显示，输完按回车）。即使加了 sudo，脚本也会自动改回你自己的身份执行。
 
 功能：
   1. 清理 Claude Code 缓存、日志、临时文件（--cache）
@@ -16,11 +23,18 @@
   6. 安装 / 卸载 Claude Code 和 Claude Desktop
      （install-code / uninstall-code / install-desktop / uninstall-desktop）
 
+状态检查：
+  菜单顶部和每次执行结束后都会显示当前状态：
+    ✓ 表示这一项已经达标，✗ 表示还没达标。
+  时区这一项只有「时区正确」并且 macOS 的「自动设置时区」已关闭才算 ✓。
+
 注意：
-  - 修改时区、Linux 上修改语言需要管理员权限，会要求输入 sudo 密码；语言需要注销或重启后生效。
+  - 修改时区、Linux 上修改语言需要管理员权限（当前账户必须是管理员）；语言需要注销或重启后生效。
+  - 时区改完后脚本会核对实际结果，没改成会明确报「失败」并给出原因，不会假装成功。
   - macOS 会同时关闭「自动设置时区」，否则时区会被定位改回去。
   - Claude Code 必须完全退出，否则拒绝清理（可加 --force 跳过检查）。
-  - Chrome 必须完全退出，否则 Chrome 缓存和语言会跳过。
+  - Chrome 在运行时会询问是否帮你退出（正常退出，标签页下次可恢复）；选否则跳过 Chrome。
+    加了 -y / --yes 时不再询问，会直接退出 Chrome。
   - Chrome 只清缓存子目录，不删除书签、密码、登录状态。
   - 会话历史删除后无法恢复，--all 不包含它，需要单独加 --history。
   - Claude Code 卸载默认保留配置和会话数据；只有加 --remove-data 才会删除。
