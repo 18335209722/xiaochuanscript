@@ -1,0 +1,36 @@
+小川环境助手 · macOS / Linux 版 · 使用说明
+
+运行（macOS 和 Linux 是同一个脚本，会自动识别系统）：
+  chmod +x xiaochuan-env.sh
+  ./xiaochuan-env.sh              交互菜单
+  ./xiaochuan-env.sh --all        直接执行：清缓存 + Chrome + 时区 + 语言
+  ./xiaochuan-env.sh --all --dry-run   演练，只显示将要做的事
+  ./xiaochuan-env.sh --help       全部参数
+
+功能：
+  1. 清理 Claude Code 缓存、日志、临时文件（--cache）
+  2. 可选清理 Claude Code 会话历史（--history）
+  3. 清理 Chrome 缓存，并把 Chrome 语言设为 en-US（--chrome）
+  4. 修改时区为 America/Los_Angeles（--timezone）
+  5. 修改系统语言/区域为 en-US，并清空键盘布局只留美式键盘（--language）
+  6. 安装 / 卸载 Claude Code 和 Claude Desktop
+     （install-code / uninstall-code / install-desktop / uninstall-desktop）
+
+注意：
+  - 修改时区、Linux 上修改语言需要管理员权限，会要求输入 sudo 密码；语言需要注销或重启后生效。
+  - macOS 会同时关闭「自动设置时区」，否则时区会被定位改回去。
+  - Claude Code 必须完全退出，否则拒绝清理（可加 --force 跳过检查）。
+  - Chrome 必须完全退出，否则 Chrome 缓存和语言会跳过。
+  - Chrome 只清缓存子目录，不删除书签、密码、登录状态。
+  - 会话历史删除后无法恢复，--all 不包含它，需要单独加 --history。
+  - Claude Code 卸载默认保留配置和会话数据；只有加 --remove-data 才会删除。
+  - Claude Desktop 只支持 macOS，需要 Homebrew；卸载不会删除聊天记录和项目文件。
+  - 改语言时会清空键盘布局 / 输入法列表，只留美式键盘（和 Windows 版一致）；
+    中文输入法本身不会被卸载，需要时到系统设置里重新添加。
+  - 不会删除中文语言包。
+
+备份位置：
+  ~/.xiaochuan-env/backups/<时间>/
+    chrome-files/           修改前的 Chrome Local State 和 Preferences
+    settings-snapshot.txt   修改前的时区、语言和键盘布局
+    keyboard/               修改前的输入法配置文件
