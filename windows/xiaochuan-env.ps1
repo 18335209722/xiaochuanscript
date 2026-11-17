@@ -246,8 +246,16 @@ function Set-ChromeJsonCore([string]$File, [string]$Mode) {
     if ($Mode -eq 'local') {
         $data['intl']['app_locale'] = 'en-US'
     } else {
+        # 语言列表整体替换成只有英文：中文等其它语言都会被删掉。
         $data['intl']['accept_languages'] = 'en-US,en'
         $data['intl']['selected_languages'] = 'en-US,en'
+        # 拼写检查词典、「不翻译的语言」、翻译目标语言也只留英文。
+        if (-not $data.ContainsKey('spellcheck') -or -not ($data['spellcheck'] -is [System.Collections.IDictionary])) {
+            $data['spellcheck'] = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+        }
+        $data['spellcheck']['dictionaries'] = [object[]]@('en-US')
+        $data['translate_blocked_languages'] = [object[]]@('en')
+        $data['translate_recent_target'] = 'en'
     }
     $tmp = "$File.xc-tmp"
     [IO.File]::WriteAllText($tmp, $ser.Serialize($data), (New-Object Text.UTF8Encoding($false)))
@@ -327,7 +335,7 @@ function Clear-Chrome {
         if (Test-Path -LiteralPath $prefs) {
             Backup-File $prefs "chrome-files\$($p.Name)\Preferences"
             if ($DryRun) {
-                Write-Log "（演练）$($p.Name)\Preferences 的 Accept-Language 设为 en-US,en"
+                Write-Log "（演练）$($p.Name)\Preferences 的语言列表改为只有英文（en-US,en），删除中文等其它语言"
             } else {
                 if (-not (Set-ChromeJson $prefs 'prefs' "$($p.Name)\Preferences")) { $langOk = $false }
             }

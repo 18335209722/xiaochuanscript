@@ -280,8 +280,16 @@ if not isinstance(intl, dict):
 if mode == "local":
     intl["app_locale"] = "en-US"
 else:
+    # 语言列表整体替换成只有英文：中文等其它语言都会被删掉。
     intl["accept_languages"] = "en-US,en"
     intl["selected_languages"] = "en-US,en"
+    # 拼写检查词典、「不翻译的语言」、翻译目标语言也只留英文。
+    spell = data.get("spellcheck")
+    if not isinstance(spell, dict):
+        spell = data["spellcheck"] = {}
+    spell["dictionaries"] = ["en-US"]
+    data["translate_blocked_languages"] = ["en"]
+    data["translate_recent_target"] = "en"
 tmp = path + ".xc-tmp"
 with open(tmp, "w", encoding="utf-8") as fh:
     json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
@@ -315,8 +323,14 @@ set_chrome_json_perl() {
         if ($mode eq "local") {
             $data->{intl}{app_locale} = "en-US";
         } else {
+            # 语言列表整体替换成只有英文：中文等其它语言都会被删掉。
             $data->{intl}{accept_languages} = "en-US,en";
             $data->{intl}{selected_languages} = "en-US,en";
+            # 拼写检查词典、「不翻译的语言」、翻译目标语言也只留英文。
+            $data->{spellcheck} = {} unless ref($data->{spellcheck}) eq "HASH";
+            $data->{spellcheck}{dictionaries} = ["en-US"];
+            $data->{translate_blocked_languages} = ["en"];
+            $data->{translate_recent_target} = "en";
         }
         open(my $out, ">", "$file.xc-tmp") or die "write: $!";
         print $out $json->encode($data);
@@ -364,7 +378,7 @@ clean_chrome() {
         if [ -f "$profile/Preferences" ]; then
             backup_file "$profile/Preferences" "chrome-files/$name/Preferences"
             if [ "$DRY_RUN" = "1" ]; then
-                log "（演练）$name/Preferences 的 Accept-Language 设为 en-US,en"
+                log "（演练）$name/Preferences 的语言列表改为只有英文（en-US,en），删除中文等其它语言"
             elif ! set_chrome_json "$profile/Preferences" prefs; then
                 fail "$name Preferences 修改失败。"
                 lang_ok=0
