@@ -613,6 +613,13 @@ function Install-EnglishPack {
         return
     }
     $manual = '可到 设置 > 时间和语言 > 语言和区域 手动添加 English (United States)，或稍后重新运行本脚本'
+    # 语言包是通过 Windows 更新下载的：更新服务被禁用时一定下不下来，先查出来，失败时直接说明原因。
+    $wuOff = $false
+    try { $wuOff = ((Get-Service -Name wuauserv -ErrorAction Stop).StartType -eq 'Disabled') } catch { }
+    if ($wuOff) {
+        $manual = "原因很可能是「Windows 更新」服务（wuauserv）被禁用了，请先在 服务 里把它改回「手动」；$manual"
+        Write-Note '「Windows 更新」服务（wuauserv）是禁用状态，英文语言包很可能下载不了。'
+    }
     # 只装显示语言包，不带语音、手写、OCR 这些附加功能：下载量小很多，也更不容易卡住。
     $lite = $false
     try { $lite = (Get-Command Install-Language).Parameters.ContainsKey('ExcludeFeatures') } catch { }
@@ -660,8 +667,8 @@ function Install-EnglishPack {
         $script:LangPackState = 'ok'
         Write-Log '英文显示语言包已安装。'
     } elseif ($state -eq 'Running') {
-        $why = if ($skipped) { '已按 S 跳过' } else { "等了 $LangPackTimeoutMin 分钟还没下载完，不再等待" }
-        $script:LangPackState = "没有装上（$why；多半是网络连不上 Windows 更新）。界面文字会继续显示中文；$manual"
+        $why = if ($skipped) { '已按 S 跳过' } else { "等了 $LangPackTimeoutMin 分钟还没下载完，不再等待；多半是网络连不上 Windows 更新" }
+        $script:LangPackState = "没有装上（$why）。界面文字会继续显示中文；$manual"
         Write-Note "英文显示语言包$($script:LangPackState)"
     } else {
         if (-not $err) { $err = '安装命令结束了，但系统里仍然没有英文显示语言包' }
@@ -676,7 +683,14 @@ function Install-EnglishPack {
 function Test-LocSystemOff { return ((Get-RegValue "HKLM:\$LocConsent" 'Value') -eq 'Deny') }
 function Test-LocUserOff { return ((Get-RegValue "HKCU:\$LocConsent" 'Value') -eq 'Deny') }
 function Test-LocDesktopOff { return ((Get-RegValue "HKCU:\$LocConsent\NonPackaged" 'Value') -eq 'Deny') }
-function Test-LocOff { return ((Test-LocSystemOff) -and (Test-LocUserOff) -and (Test-LocDesktopOff)) }
+# 还开着的定位开关（名字）；全关了返回空。状态检查和执行结果共用。
+function Get-LocOnParts {
+    $on = @()
+    if (-not (Test-LocSystemOff)) { $on += '「定位服务」总开关' }
+    if (-not (Test-LocUserOff)) { $on += '「允许应用访问你的位置」' }
+    if (-not (Test-LocDesktopOff)) { $on += '「允许桌面应用访问你的位置」' }
+    return $on
+}
 
 function Set-LocConsentDeny([string]$Hive, [string]$Sub) {
     $path = "${Hive}:\$LocConsent$Sub"
@@ -791,8 +805,9 @@ function Show-Status {
     $script:StatusBad = 0
     Write-StatusLine $tzMark "时区：$tz（目标 $TargetTz$auto）"
     Write-StatusLine $langMark "系统语言：$lang（目标 en-US）"
-    if (Test-LocOff) { Write-StatusLine '√' '系统定位：已关闭' }
-    else { Write-StatusLine '×' '系统定位：开着（目标 关闭）' }
+    $locOn = @(Get-LocOnParts)
+    if ($locOn.Count -eq 0) { Write-StatusLine '√' '系统定位：已关闭' }
+    else { Write-StatusLine '×' "系统定位：这些还开着：$($locOn -join '、')（目标 全部关闭）" }
     $cl = Get-ChromeLang
     if ($null -eq $cl) {
         Write-Host '  - Chrome：未检测到'
@@ -830,22 +845,21 @@ function Show-Verify([bool]$WantCache, [bool]$WantHistory, [bool]$WantChrome, [b
         elseif ($script:LangPackState) { Add-Bad "英文显示语言包：$($script:LangPackState)"; $failed++ }
     }
     if ($WantLoc) {
-        $bad = @()
-        if (-not (Test-LocSystemOff)) { $bad += '「定位服务」总开关' }
-        if (-not (Test-LocUserOff)) { $bad += '「允许应用访问你的位置」' }
-        if (-not (Test-LocDesktopOff)) { $bad += '「允许桌面应用访问你的位置」' }
+        $bad = @(Get-LocOnParts)
         if ($bad.Count -eq 0) { Add-Ok '系统定位：定位服务已关闭' }
         else { Add-Bad "系统定位：这些还开着：$($bad -join '、')"; $failed++ }
     }
     if ($WantChrome) {
+        $geoOn = @()
+        if (Test-Path -LiteralPath $ChromeData) { $geoOn = @(Get-ChromeGeoOnProfiles) }
         if (-not (Test-Path -LiteralPath $ChromeData)) {
             Add-Info 'Chrome：这台电脑没有装 Chrome，无需处理'
         } elseif (Test-ChromeRunning) {
             Add-Bad 'Chrome：还在运行，没有彻底退出'; $failed++
         } elseif ((Get-ChromeLang) -ne 'en-US') {
             Add-Bad "Chrome 语言：当前是 $(Get-ChromeLang)，目标 en-US"; $failed++
-        } elseif (@(Get-ChromeGeoOnProfiles).Count -gt 0) {
-            Add-Bad "Chrome 定位：这些个人资料还没关掉：$(@(Get-ChromeGeoOnProfiles) -join '、')"; $failed++
+        } elseif ($geoOn.Count -gt 0) {
+            Add-Bad "Chrome 定位：这些个人资料还没关掉：$($geoOn -join '、')"; $failed++
         } else {
             Add-Ok 'Chrome：已彻底退出，缓存已清理，语言 en-US，定位已关闭'
         }
