@@ -2,10 +2,11 @@
 # 小川环境助手 · macOS / Linux 版
 # 功能对齐 Windows 版 XiaochuanEnv 1.0.0：
 #   清理 Claude Code 缓存 / 会话历史、清理 Chrome 缓存并设为 en-US、
-#   时区改为 America/Los_Angeles、系统语言改为 en-US、安装 / 卸载 Claude。
+#   时区改为 America/Los_Angeles、系统语言改为 en-US、关闭系统定位和 Chrome 定位、
+#   安装 / 卸载 Claude。
 # 兼容 macOS 自带的 bash 3.2：不使用关联数组、mapfile、${var,,} 等新语法。
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 TARGET_TZ="America/Los_Angeles"
 
 case "$(uname -s)" in
@@ -52,6 +53,7 @@ DO_HISTORY=0
 DO_CHROME=0
 DO_TZ=0
 DO_LANG=0
+DO_LOC=0
 ACTION=""
 
 ERRORS=0
@@ -311,13 +313,28 @@ clean_claude() {
 
 # --------------------------------------------------------------------- Chrome
 
-# 核对 Chrome 配置文件里的语言是否已经是目标值。$1 文件  $2 local|prefs
+# 个人资料的配置里，定位的默认值是不是「禁止」（2）。$1 文件
+chrome_geo_off() {
+    grep -q '"default_content_setting_values" *: *{[^{}]*"geolocation" *: *2' "$1" 2>/dev/null
+}
+
+# 核对 Chrome 配置文件里的语言（和个人资料里的定位开关）是否已经是目标值。$1 文件  $2 local|prefs
 chrome_json_ok() {
     if [ "$2" = "local" ]; then
         grep -q '"app_locale" *: *"en-US"' "$1" 2>/dev/null
     else
-        grep -q '"accept_languages" *: *"en-US,en"' "$1" 2>/dev/null
+        grep -q '"accept_languages" *: *"en-US,en"' "$1" 2>/dev/null && chrome_geo_off "$1"
     fi
+}
+
+# 还没关掉定位的 Chrome 个人资料（目录名，用顿号隔开）；都关了则输出空。
+chrome_geo_on_profiles() {
+    local profile out=""
+    for profile in "$CHROME_DATA/Default" "$CHROME_DATA"/Profile\ *; do
+        [ -f "$profile/Preferences" ] || continue
+        chrome_geo_off "$profile/Preferences" || out="${out:+$out、}$(basename "$profile")"
+    done
+    printf '%s' "$out"
 }
 
 set_chrome_json_python() {
@@ -343,6 +360,18 @@ else:
     spell["dictionaries"] = ["en-US"]
     data["translate_blocked_languages"] = ["en"]
     data["translate_recent_target"] = "en"
+    # 定位：默认改成「不允许网站查看我的位置」（2 = 禁止），以前单独允许过的网站也一并清掉。
+    prof = data.get("profile")
+    if not isinstance(prof, dict):
+        prof = data["profile"] = {}
+    defaults = prof.get("default_content_setting_values")
+    if not isinstance(defaults, dict):
+        defaults = prof["default_content_setting_values"] = {}
+    defaults["geolocation"] = 2
+    cs = prof.get("content_settings")
+    if isinstance(cs, dict) and isinstance(cs.get("exceptions"), dict):
+        for key in ("geolocation", "geolocation_with_options"):
+            cs["exceptions"].pop(key, None)
 tmp = path + ".xc-tmp"
 with open(tmp, "w", encoding="utf-8") as fh:
     json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
@@ -384,6 +413,15 @@ set_chrome_json_perl() {
             $data->{spellcheck}{dictionaries} = ["en-US"];
             $data->{translate_blocked_languages} = ["en"];
             $data->{translate_recent_target} = "en";
+            # 定位：默认改成「不允许网站查看我的位置」（2 = 禁止），以前单独允许过的网站也一并清掉。
+            $data->{profile} = {} unless ref($data->{profile}) eq "HASH";
+            my $prof = $data->{profile};
+            $prof->{default_content_setting_values} = {} unless ref($prof->{default_content_setting_values}) eq "HASH";
+            $prof->{default_content_setting_values}{geolocation} = 2;
+            my $cs = $prof->{content_settings};
+            if (ref($cs) eq "HASH" && ref($cs->{exceptions}) eq "HASH") {
+                delete $cs->{exceptions}{$_} for ("geolocation", "geolocation_with_options");
+            }
         }
         open(my $out, ">", "$file.xc-tmp") or die "write: $!";
         print $out $json->encode($data);
@@ -404,14 +442,14 @@ clean_chrome() {
         elif log "Chrome 正在运行，先把它关闭…" && quit_chrome; then
             log "Chrome 已关闭。"
         else
-            fail "Chrome 关不掉，已跳过缓存和语言修改；请手动完全退出 Chrome 后重试。"
+            fail "Chrome 关不掉，已跳过缓存、语言和定位修改；请手动完全退出 Chrome 后重试。"
             return 0
         fi
     fi
 
     local before_kb="$FREED_KB" before_n="$REMOVED" profiles=0 profile name sub
     local lang_ok=1
-    log "正在清理 Chrome 缓存并设置 en-US…"
+    log "正在清理 Chrome 缓存、设置 en-US 并关闭 Chrome 定位…"
 
     safe_rm "$CHROME_DATA/ShaderCache" "$CHROME_DATA"
     safe_rm "$CHROME_DATA/GrShaderCache" "$CHROME_DATA"
@@ -431,7 +469,7 @@ clean_chrome() {
         if [ -f "$profile/Preferences" ]; then
             backup_file "$profile/Preferences" "chrome-files/$name/Preferences"
             if [ "$DRY_RUN" = "1" ]; then
-                log "（演练）$name/Preferences 的语言列表改为只有英文（en-US,en），删除中文等其它语言"
+                log "（演练）$name/Preferences 的语言列表改为只有英文（en-US,en），删除中文等其它语言；定位改为「不允许网站查看位置」"
             elif ! set_chrome_json "$profile/Preferences" prefs; then
                 fail "$name Preferences 修改失败。"
                 lang_ok=0
@@ -459,9 +497,9 @@ clean_chrome() {
     fi
 
     if [ "$lang_ok" = "1" ]; then
-        log "Chrome：清理 $((REMOVED - before_n)) 个缓存目录，释放 $(human_kb $((FREED_KB - before_kb)))；语言已设为 en-US。"
+        log "Chrome：清理 $((REMOVED - before_n)) 个缓存目录，释放 $(human_kb $((FREED_KB - before_kb)))；语言已设为 en-US，定位已关闭。"
     else
-        log "Chrome：清理 $((REMOVED - before_n)) 个缓存目录，释放 $(human_kb $((FREED_KB - before_kb)))；语言未完全修改。"
+        log "Chrome：清理 $((REMOVED - before_n)) 个缓存目录，释放 $(human_kb $((FREED_KB - before_kb)))；语言 / 定位未完全修改。"
     fi
     [ "$DRY_RUN" = "1" ] || [ ! -d "$BACKUP_DIR/chrome-files" ] || log "Chrome 备份：$BACKUP_DIR/chrome-files"
 }
@@ -520,6 +558,7 @@ snapshot_settings() {
     {
         echo "time=$(date)"
         echo "timezone=$(current_tz)"
+        echo "location=$(loc_state)"
         if [ "$OS" = "mac" ]; then
             echo "AppleLanguages=$(defaults read -g AppleLanguages 2>/dev/null | tr -d '\n')"
             echo "AppleLocale=$(defaults read -g AppleLocale 2>/dev/null)"
@@ -750,6 +789,92 @@ set_language() {
     log "语言 / 区域已设为 en-US，键盘布局只保留美式键盘；注销或重启后生效。"
 }
 
+# ------------------------------------------------------------------- 定位
+
+# macOS「定位服务」总开关：1 开，0 关，空表示读不到（这个值只有管理员权限才读得到）。
+loc_enabled_mac() {
+    local v=""
+    have_root || return 0
+    v="$(sudo -n -u _locationd defaults -currentHost read com.apple.locationd LocationServicesEnabled 2>/dev/null)"
+    if [ -z "$v" ]; then
+        v="$(sudo -n defaults read /var/db/locationd/Library/Preferences/ByHost/com.apple.locationd LocationServicesEnabled 2>/dev/null)"
+    fi
+    printf '%s' "$v"
+}
+
+# Linux 上有没有 GeoClue 定位服务。
+geoclue_present() {
+    command -v systemctl >/dev/null 2>&1 && systemctl cat geoclue.service >/dev/null 2>&1
+}
+
+# 系统定位服务的状态：输出 off / on / unknown。
+loc_state() {
+    local v
+    if [ "$OS" = "mac" ]; then
+        case "$(loc_enabled_mac)" in
+            0) echo off ;;
+            1) echo on ;;
+            *) echo unknown ;;
+        esac
+        return 0
+    fi
+    if command -v gsettings >/dev/null 2>&1; then
+        v="$(gsettings get org.gnome.system.location enabled 2>/dev/null)"
+        if [ "$v" = "true" ]; then echo on; return 0; fi
+    fi
+    if geoclue_present && [ "$(systemctl is-enabled geoclue.service 2>/dev/null)" != "masked" ]; then
+        echo on
+        return 0
+    fi
+    echo off
+}
+
+# 关闭 macOS「定位服务」：一种方式不行就换下一种，以实际读回来的值为准。
+disable_location_mac() {
+    run_root sudo -u _locationd defaults -currentHost write com.apple.locationd LocationServicesEnabled -int 0 >/dev/null 2>&1
+    if [ "$(loc_enabled_mac)" != "0" ]; then
+        run_root defaults write /var/db/locationd/Library/Preferences/ByHost/com.apple.locationd LocationServicesEnabled -int 0 >/dev/null 2>&1
+    fi
+    # 让定位服务重新读一遍设置（它会被系统自动拉起来）。
+    run_root killall locationd >/dev/null 2>&1
+    sleep 1
+    [ "$(loc_enabled_mac)" = "0" ]
+}
+
+# 关闭 Linux 定位：GNOME 的「定位服务」开关 + 屏蔽 GeoClue 服务。
+disable_location_linux() {
+    if command -v gsettings >/dev/null 2>&1; then
+        gsettings set org.gnome.system.location enabled false >/dev/null 2>&1
+    fi
+    if geoclue_present; then
+        run_root systemctl mask --now geoclue.service >/dev/null 2>&1
+    fi
+    [ "$(loc_state)" = "off" ]
+}
+
+set_location() {
+    [ "$DO_LOC" = "1" ] || return 0
+    log "准备关闭系统定位服务…"
+    if [ "$DRY_RUN" = "1" ]; then
+        if [ "$OS" = "mac" ]; then
+            log "（演练）关闭 系统设置 > 隐私与安全性 > 定位服务 的总开关"
+        else
+            log "（演练）关闭 GNOME 的「定位服务」开关，并屏蔽 GeoClue 定位服务"
+        fi
+        return 0
+    fi
+    if [ "$OS" = "mac" ]; then
+        if ! disable_location_mac; then
+            fail "系统定位服务没关掉（新版 macOS 可能不让脚本改）；请到 系统设置 > 隐私与安全性 > 定位服务 手动关闭。"
+            return 1
+        fi
+    elif ! disable_location_linux; then
+        fail "系统定位服务没关掉；请到 设置 > 隐私 > 定位服务 手动关闭。"
+        return 1
+    fi
+    log "系统定位服务已关闭。"
+}
+
 # ------------------------------------------------------- 安装 / 卸载 Claude
 
 install_code() {
@@ -852,7 +977,7 @@ status_line() {
 
 # 逐项显示当前状态，✓ 表示已经符合目标，✗ 表示还需要处理。
 status() {
-    local code="未安装" desktop="未安装" tz lang cl t_ok="✗" l_ok="✗" c_ok="✗" auto=""
+    local code="未安装" desktop="未安装" tz lang cl t_ok="✗" l_ok="✗" c_ok="✗" auto="" geo_on=""
     command -v claude >/dev/null 2>&1 && code="已安装"
     [ -x "$HOME/.local/bin/claude" ] && code="已安装"
     [ "$OS" = "mac" ] && [ -d "/Applications/Claude.app" ] && desktop="已安装"
@@ -870,10 +995,21 @@ status() {
     STATUS_BAD=0
     status_line "$t_ok" "时区：${tz:-未知}（目标 $TARGET_TZ$auto）"
     status_line "$l_ok" "系统语言：${lang:-未知}（目标 en-US）"
+    case "$(loc_state)" in
+        off) status_line "✓" "系统定位：已关闭" ;;
+        on) status_line "✗" "系统定位：开着（目标 关闭）" ;;
+        *) echo "  - 系统定位：现在读不到（要管理员权限）；执行「关闭系统定位」后会核对" ;;
+    esac
     if [ -f "$CHROME_DATA/Local State" ]; then
         cl="$(chrome_lang)"
         [ "$cl" = "en-US" ] && c_ok="✓"
         status_line "$c_ok" "Chrome 语言：${cl:-未设置，跟随系统}（目标 en-US）"
+        geo_on="$(chrome_geo_on_profiles)"
+        if [ -z "$geo_on" ]; then
+            status_line "✓" "Chrome 定位：已关闭"
+        else
+            status_line "✗" "Chrome 定位：这些个人资料还开着：$geo_on（目标 关闭）"
+        fi
     else
         echo "  - Chrome：未检测到"
     fi
@@ -883,8 +1019,8 @@ status() {
 
 # 执行后逐项核对「选中的项目」有没有真的达到目标；没达到的记为失败。
 verify_results() {
-    local want_cache="$1" want_history="$2" want_chrome="$3" want_tz="$4" want_lang="$5"
-    local item left cl
+    local want_cache="$1" want_history="$2" want_chrome="$3" want_tz="$4" want_lang="$5" want_loc="$6"
+    local item left cl geo_on
     if [ "$want_tz" = "1" ]; then
         if tz_ok; then
             ok_item "时区：$(current_tz)"
@@ -901,19 +1037,34 @@ verify_results() {
             VERIFY_FAILED=$((VERIFY_FAILED + 1))
         fi
     fi
+    if [ "$want_loc" = "1" ]; then
+        case "$(loc_state)" in
+            off) ok_item "系统定位：定位服务已关闭" ;;
+            on)
+                bad_item "系统定位：定位服务还开着"
+                VERIFY_FAILED=$((VERIFY_FAILED + 1)) ;;
+            *)
+                bad_item "系统定位：无法确认是否已关闭，请到 系统设置 > 隐私与安全性 > 定位服务 看一下"
+                VERIFY_FAILED=$((VERIFY_FAILED + 1)) ;;
+        esac
+    fi
     if [ "$want_chrome" = "1" ]; then
         if [ ! -d "$CHROME_DATA" ]; then
             info_item "Chrome：这台电脑没有装 Chrome，无需处理"
         else
             cl="$(chrome_lang)"
+            geo_on="$(chrome_geo_on_profiles)"
             if chrome_running; then
                 bad_item "Chrome：还在运行，没有彻底退出"
                 VERIFY_FAILED=$((VERIFY_FAILED + 1))
             elif [ "$cl" != "en-US" ]; then
                 bad_item "Chrome 语言：当前是 ${cl:-未设置}，目标 en-US"
                 VERIFY_FAILED=$((VERIFY_FAILED + 1))
+            elif [ -n "$geo_on" ]; then
+                bad_item "Chrome 定位：这些个人资料还没关掉：$geo_on"
+                VERIFY_FAILED=$((VERIFY_FAILED + 1))
             else
-                ok_item "Chrome：已彻底退出，缓存已清理，语言 en-US"
+                ok_item "Chrome：已彻底退出，缓存已清理，语言 en-US，定位已关闭"
             fi
         fi
     fi
@@ -944,7 +1095,7 @@ verify_results() {
 }
 
 run_pipeline() {
-    if [ "$DO_CACHE$DO_HISTORY$DO_CHROME$DO_TZ$DO_LANG" = "00000" ]; then
+    if [ "$DO_CACHE$DO_HISTORY$DO_CHROME$DO_TZ$DO_LANG$DO_LOC" = "000000" ]; then
         echo "请至少选择一个执行项目。"
         return 1
     fi
@@ -958,7 +1109,7 @@ run_pipeline() {
     fi
     # 记下用户选了什么，最后按这个逐项核对。
     local want_cache="$DO_CACHE" want_history="$DO_HISTORY" want_chrome="$DO_CHROME"
-    local want_tz="$DO_TZ" want_lang="$DO_LANG"
+    local want_tz="$DO_TZ" want_lang="$DO_LANG" want_loc="$DO_LOC"
 
     # 一开始就拿管理员权限：时区、Linux 语言必须用；其余项目在普通方式失败时也会用它重试。
     if [ "$DRY_RUN" != "1" ] && [ "$(id -u)" != "0" ]; then
@@ -973,13 +1124,14 @@ run_pipeline() {
         log "时区已经是 $TARGET_TZ，无需修改。"
         DO_TZ=0
     fi
-    if [ "$DO_TZ" = "1" ] || [ "$DO_LANG" = "1" ]; then
+    if [ "$DO_TZ" = "1" ] || [ "$DO_LANG" = "1" ] || [ "$DO_LOC" = "1" ]; then
         snapshot_settings
     fi
 
-    # 先做需要管理员权限的两项，免得清理耗时太久导致 sudo 授权过期。
+    # 先做需要管理员权限的几项，免得清理耗时太久导致 sudo 授权过期。
     set_timezone
     set_language
+    set_location
     clean_claude
     clean_chrome
 
@@ -989,7 +1141,7 @@ run_pipeline() {
     fi
 
     # 逐项核对的结果记进「执行结果」，由调用的地方统一打印。
-    verify_results "$want_cache" "$want_history" "$want_chrome" "$want_tz" "$want_lang"
+    verify_results "$want_cache" "$want_history" "$want_chrome" "$want_tz" "$want_lang" "$want_loc"
     info_item "共释放 $(human_kb "$FREED_KB")"
     if [ "$want_lang" = "1" ]; then
         info_item "提示：语言和键盘设置需要注销或重启电脑后才完全生效"
@@ -1000,7 +1152,7 @@ run_pipeline() {
 menu() {
     local c picked act choices
     while :; do
-        DO_CACHE=0; DO_HISTORY=0; DO_CHROME=0; DO_TZ=0; DO_LANG=0
+        DO_CACHE=0; DO_HISTORY=0; DO_CHROME=0; DO_TZ=0; DO_LANG=0; DO_LOC=0
         REMOVE_DATA=0; ERRORS=0; FREED_KB=0; REMOVED=0
         RESULTS=""; OK_COUNT=0; BAD_COUNT=0
         picked=0; act=""
@@ -1011,10 +1163,11 @@ menu() {
         echo
         echo "  1) 清理 Claude Code 缓存、日志、临时文件"
         echo "  2) 清理 Claude Code 会话历史（不可恢复）"
-        echo "  3) 清理 Chrome 缓存，并把 Chrome 语言设为 en-US"
+        echo "  3) 清理 Chrome 缓存，把 Chrome 语言设为 en-US，并关闭 Chrome 定位"
         echo "  4) 时区改为 $TARGET_TZ"
         echo "  5) 系统语言 / 区域改为 en-US，键盘布局只留美式键盘"
-        echo "  a) 一键执行 1 3 4 5（推荐）"
+        echo "  6) 关闭系统定位服务"
+        echo "  a) 一键执行 1 3 4 5 6（推荐）"
         echo "  i) 安装 Claude Code        u) 卸载 Claude Code"
         echo "  I) 安装 Claude Desktop     U) 卸载 Claude Desktop"
         echo "  q) 退出"
@@ -1034,7 +1187,8 @@ menu() {
                 3) DO_CHROME=1; picked=1 ;;
                 4) DO_TZ=1; picked=1 ;;
                 5) DO_LANG=1; picked=1 ;;
-                a|A) DO_CACHE=1; DO_CHROME=1; DO_TZ=1; DO_LANG=1; picked=1 ;;
+                6) DO_LOC=1; picked=1 ;;
+                a|A) DO_CACHE=1; DO_CHROME=1; DO_TZ=1; DO_LANG=1; DO_LOC=1; picked=1 ;;
                 i) act="install_code" ;;
                 u) act="uninstall_code" ;;
                 I) act="install_desktop" ;;
@@ -1073,7 +1227,7 @@ usage() {
 用法：
   bash $0                  交互菜单（不带参数）
   bash $0 [选项]           按选项直接执行
-  bash $0 status           检查当前状态（时区 / 语言 / Chrome 是否已达标）
+  bash $0 status           检查当前状态（时区 / 语言 / 定位 / Chrome 是否已达标）
   bash $0 install-code     安装 Claude Code
   bash $0 uninstall-code [--remove-data]
   bash $0 install-desktop  安装 Claude Desktop（仅 macOS）
@@ -1082,10 +1236,11 @@ usage() {
 选项：
   --cache        清理 Claude Code 缓存、日志、临时文件
   --history      清理 Claude Code 会话历史（不可恢复）
-  --chrome       清理 Chrome 缓存，并把 Chrome 语言设为 en-US
+  --chrome       清理 Chrome 缓存，把 Chrome 语言设为 en-US，并关闭 Chrome 定位
   --timezone     时区改为 $TARGET_TZ
   --language     系统语言 / 区域改为 en-US，并清空键盘布局只留美式键盘
-  --all          等于 --cache --chrome --timezone --language（不含 --history）
+  --location     关闭系统定位服务
+  --all          等于 --cache --chrome --timezone --language --location（不含 --history）
   --dry-run      演练：只显示将要做的事，不做任何修改
   --force        Claude Code 在运行时也继续清理
   -y, --yes      不再逐项确认
@@ -1102,7 +1257,8 @@ while [ $# -gt 0 ]; do
         --chrome) DO_CHROME=1 ;;
         --timezone) DO_TZ=1 ;;
         --language) DO_LANG=1 ;;
-        --all) DO_CACHE=1; DO_CHROME=1; DO_TZ=1; DO_LANG=1 ;;
+        --location) DO_LOC=1 ;;
+        --all) DO_CACHE=1; DO_CHROME=1; DO_TZ=1; DO_LANG=1; DO_LOC=1 ;;
         --dry-run) DRY_RUN=1 ;;
         --force) FORCE=1 ;;
         --remove-data) REMOVE_DATA=1 ;;
@@ -1124,7 +1280,7 @@ case "$ACTION" in
         status
         echo "=========================================="
         if [ "$STATUS_BAD" = "0" ]; then
-            printf '%s 结果：时区、语言都已达标 %s\n' "$C_OK_BAR" "$C_OFF"
+            printf '%s 结果：时区、语言、定位都已达标 %s\n' "$C_OK_BAR" "$C_OFF"
         else
             printf '%s 结果：有 %s 项还没达标（上面标 ✗ 的红色行） %s\n' "$C_BAD_BAR" "$STATUS_BAD" "$C_OFF"
         fi
@@ -1132,7 +1288,7 @@ case "$ACTION" in
         exit $?
         ;;
     "")
-        if [ "$DO_CACHE$DO_HISTORY$DO_CHROME$DO_TZ$DO_LANG" != "00000" ]; then
+        if [ "$DO_CACHE$DO_HISTORY$DO_CHROME$DO_TZ$DO_LANG$DO_LOC" != "000000" ]; then
             run_pipeline
         elif [ -t 0 ]; then
             # 菜单里每执行完一次都会打印「执行结果」，这里不用再打印。

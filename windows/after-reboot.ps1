@@ -137,8 +137,8 @@ function Invoke-ChromeProfile {
             return
         }
         # 提前写好这份配置，Chrome 第一次用这个目录时就会按它建个人资料：
-        # 名字是指定的名字，不登录任何账号，语言只有英文。
-        $json = '{"profile":{"name":"' + $Name + '","using_default_name":false},' +
+        # 名字是指定的名字，不登录任何账号，语言只有英文，定位默认关闭（geolocation 2 = 禁止）。
+        $json = '{"profile":{"name":"' + $Name + '","using_default_name":false,"default_content_setting_values":{"geolocation":2}},' +
             '"intl":{"accept_languages":"en-US,en","selected_languages":"en-US,en"},' +
             '"spellcheck":{"dictionaries":["en-US"]},"translate_blocked_languages":["en"],"translate_recent_target":"en"}'
         $utf8 = New-Object Text.UTF8Encoding($false)

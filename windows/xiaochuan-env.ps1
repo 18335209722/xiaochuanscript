@@ -1,7 +1,8 @@
 ﻿# 小川环境助手 · Windows 脚本版
 # 功能和 XiaochuanEnv.exe / macOS、Linux 版 xiaochuan-env.sh 对齐：
 #   清理 Claude Code 缓存 / 会话历史、清理 Chrome 缓存并设为 en-US、
-#   时区改为太平洋时间（America/Los_Angeles）、系统语言改为 en-US、安装 / 卸载 Claude。
+#   时区改为太平洋时间（America/Los_Angeles）、系统语言改为 en-US、关闭系统定位和 Chrome 定位、
+#   安装 / 卸载 Claude。
 # 兼容 Windows 自带的 PowerShell 5.1。本文件必须保存为「UTF-8 带 BOM」，否则中文会乱码。
 
 [CmdletBinding()]
@@ -13,6 +14,7 @@ param(
     [switch]$Chrome,
     [switch]$Timezone,
     [switch]$Language,
+    [switch]$Location,
     [switch]$All,
     [switch]$DryRun,
     [switch]$Force,
@@ -25,7 +27,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Version = '1.1.0'
+$Version = '1.2.0'
 $TargetTz = 'Pacific Standard Time'          # 即 America/Los_Angeles
 $TargetTzName = 'America/Los_Angeles'
 
@@ -34,6 +36,10 @@ $ClaudeDir = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-
 $ClaudeJson = if ($env:CLAUDE_CONFIG_DIR) { Join-Path $env:CLAUDE_CONFIG_DIR '.claude.json' } else { Join-Path $env:USERPROFILE '.claude.json' }
 $ChromeData = Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data'
 $TzAutoKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\tzautoupdate'
+# 「定位服务」总开关（设置 > 隐私和安全性 > 位置）：Value 为 Deny 表示关。
+$LocConsent = 'SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location'
+# 英文显示语言包最多等这么久；超时就不再等，其余项目照常完成。
+$LangPackTimeoutMin = 15
 
 $script:Errors = 0
 $script:FreedBytes = [int64]0
@@ -44,6 +50,8 @@ $script:DoHistory = $false
 $script:DoChrome = $false
 $script:DoTz = $false
 $script:DoLang = $false
+$script:DoLoc = $false
+$script:LangPackState = ''
 $script:RemoveUserData = [bool]$RemoveData
 
 # ~.claude 下要清理的项目；执行结果也用这两份清单。
@@ -277,7 +285,7 @@ function Set-ChromeJsonCore([string]$File, [string]$Mode) {
     $data = $ser.DeserializeObject([IO.File]::ReadAllText($File, [Text.Encoding]::UTF8))
     if (-not ($data -is [System.Collections.IDictionary])) { throw '文件内容不是 JSON 对象' }
     if (-not $data.ContainsKey('intl') -or -not ($data['intl'] -is [System.Collections.IDictionary])) {
-        $data['intl'] = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+        $data['intl'] = [System.Collections.Generic.Dictionary[string,object]]::new()
     }
     if ($Mode -eq 'local') {
         $data['intl']['app_locale'] = 'en-US'
@@ -287,27 +295,68 @@ function Set-ChromeJsonCore([string]$File, [string]$Mode) {
         $data['intl']['selected_languages'] = 'en-US,en'
         # 拼写检查词典、「不翻译的语言」、翻译目标语言也只留英文。
         if (-not $data.ContainsKey('spellcheck') -or -not ($data['spellcheck'] -is [System.Collections.IDictionary])) {
-            $data['spellcheck'] = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+            $data['spellcheck'] = [System.Collections.Generic.Dictionary[string,object]]::new()
         }
         $data['spellcheck']['dictionaries'] = [object[]]@('en-US')
         $data['translate_blocked_languages'] = [object[]]@('en')
         $data['translate_recent_target'] = 'en'
+        # 定位：默认改成「不允许网站查看我的位置」（2 = 禁止），以前单独允许过的网站也一并清掉。
+        if (-not $data.ContainsKey('profile') -or -not ($data['profile'] -is [System.Collections.IDictionary])) {
+            $data['profile'] = [System.Collections.Generic.Dictionary[string,object]]::new()
+        }
+        $prof = $data['profile']
+        if (-not $prof.ContainsKey('default_content_setting_values') -or -not ($prof['default_content_setting_values'] -is [System.Collections.IDictionary])) {
+            $prof['default_content_setting_values'] = [System.Collections.Generic.Dictionary[string,object]]::new()
+        }
+        $prof['default_content_setting_values']['geolocation'] = 2
+        if ($prof.ContainsKey('content_settings') -and ($prof['content_settings'] -is [System.Collections.IDictionary])) {
+            $cs = $prof['content_settings']
+            if ($cs.ContainsKey('exceptions') -and ($cs['exceptions'] -is [System.Collections.IDictionary])) {
+                foreach ($k in 'geolocation', 'geolocation_with_options') {
+                    if ($cs['exceptions'].ContainsKey($k)) { [void]$cs['exceptions'].Remove($k) }
+                }
+            }
+        }
     }
     $tmp = "$File.xc-tmp"
     [IO.File]::WriteAllText($tmp, $ser.Serialize($data), (New-Object Text.UTF8Encoding($false)))
     Move-Item -LiteralPath $tmp -Destination $File -Force
 }
 
-# 读回文件核对语言是否已经是目标值。
+# 读回文件核对语言（和个人资料里的定位开关）是否已经是目标值。
 function Test-ChromeJson([string]$File, [string]$Mode) {
     try { $text = [IO.File]::ReadAllText($File, [Text.Encoding]::UTF8) } catch { return $false }
     if ($Mode -eq 'local') { return ($text -match '"app_locale"\s*:\s*"en-US"') }
-    return ($text -match '"accept_languages"\s*:\s*"en-US,en"')
+    return (($text -match '"accept_languages"\s*:\s*"en-US,en"') -and (Test-ChromeGeoText $text))
 }
 
-# 改 Chrome 配置文件的语言：直接改不行就去掉只读属性再改，再不行就夺取所有权后再改；每次都读回核对。
+# 个人资料的配置里，定位的默认值是不是「禁止」（2）。
+function Test-ChromeGeoText([string]$Text) {
+    return ($Text -match '"default_content_setting_values"\s*:\s*\{[^{}]*"geolocation"\s*:\s*2')
+}
+
+function Get-ChromeProfiles {
+    return @(Get-ChildItem -LiteralPath $ChromeData -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -eq 'Default' -or $_.Name -like 'Profile *' })
+}
+
+# 还没关掉定位的 Chrome 个人资料（目录名）。
+function Get-ChromeGeoOnProfiles {
+    $on = @()
+    foreach ($p in (Get-ChromeProfiles)) {
+        $prefs = Join-Path $p.FullName 'Preferences'
+        if (-not (Test-Path -LiteralPath $prefs)) { continue }
+        $text = ''
+        try { $text = [IO.File]::ReadAllText($prefs, [Text.Encoding]::UTF8) } catch { }
+        if (-not (Test-ChromeGeoText $text)) { $on += $p.Name }
+    }
+    return $on
+}
+
+# 改 Chrome 配置文件的语言和定位：直接改不行就去掉只读属性再改，再不行就夺取所有权后再改；每次都读回核对。
 function Set-ChromeJson([string]$File, [string]$Mode, [string]$Label) {
-    return (Invoke-Methods "$Label 的语言改为 en-US" { Test-ChromeJson $File $Mode } @(
+    $what = if ($Mode -eq 'local') { '语言改为 en-US' } else { '语言改为 en-US、关闭定位' }
+    return (Invoke-Methods "$Label 的$what" { Test-ChromeJson $File $Mode } @(
         { Set-ChromeJsonCore $File $Mode },
         {
             Invoke-Native { attrib.exe -R -S -H $File } | Out-Null
@@ -345,7 +394,7 @@ function Clear-Chrome {
             if (Stop-Chrome) {
                 Write-Log 'Chrome 已关闭。'
             } else {
-                Write-Fail 'Chrome 关不掉，已跳过缓存和语言修改；请手动完全退出 Chrome（包括右下角托盘图标）后重试。'
+                Write-Fail 'Chrome 关不掉，已跳过缓存、语言和定位修改；请手动完全退出 Chrome（包括右下角托盘图标）后重试。'
                 return
             }
         }
@@ -353,13 +402,12 @@ function Clear-Chrome {
 
     $beforeBytes = $script:FreedBytes; $beforeCount = $script:Removed
     $langOk = $true
-    Write-Log '正在清理 Chrome 缓存并设置 en-US…'
+    Write-Log '正在清理 Chrome 缓存、设置 en-US 并关闭 Chrome 定位…'
 
     foreach ($sub in 'ShaderCache', 'GrShaderCache', 'GraphiteDawnCache') {
         Remove-Safe (Join-Path $ChromeData $sub) $ChromeData
     }
-    $profiles = @(Get-ChildItem -LiteralPath $ChromeData -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -eq 'Default' -or $_.Name -like 'Profile *' })
+    $profiles = @(Get-ChromeProfiles)
     if ($profiles.Count -eq 0) { Write-Note 'Chrome 用户目录中没有找到 Profile。' }
 
     foreach ($p in $profiles) {
@@ -371,7 +419,7 @@ function Clear-Chrome {
         if (Test-Path -LiteralPath $prefs) {
             Backup-File $prefs "chrome-files\$($p.Name)\Preferences"
             if ($DryRun) {
-                Write-Log "（演练）$($p.Name)\Preferences 的语言列表改为只有英文（en-US,en），删除中文等其它语言"
+                Write-Log "（演练）$($p.Name)\Preferences 的语言列表改为只有英文（en-US,en），删除中文等其它语言；定位改为「不允许网站查看位置」"
             } else {
                 if (-not (Set-ChromeJson $prefs 'prefs' "$($p.Name)\Preferences")) { $langOk = $false }
             }
@@ -388,7 +436,7 @@ function Clear-Chrome {
         }
     }
 
-    $tail = if ($langOk) { '语言已设为 en-US。' } else { '语言未完全修改。' }
+    $tail = if ($langOk) { '语言已设为 en-US，定位已关闭。' } else { '语言 / 定位未完全修改。' }
     Write-Log ("Chrome：清理 {0} 个缓存目录，释放 {1}；{2}" -f ($script:Removed - $beforeCount), (Format-Size ($script:FreedBytes - $beforeBytes)), $tail)
     $bk = Join-Path $script:BackupDir 'chrome-files'
     if (-not $DryRun -and (Test-Path -LiteralPath $bk)) { Write-Log "Chrome 备份：$bk" }
@@ -420,6 +468,9 @@ function Save-Snapshot {
         "culture=$((Get-Culture).Name)"
         "system_locale=$((Get-WinSystemLocale).Name)"
         "home_location=$((Get-WinHomeLocation).GeoId)"
+        "location_system=$(Get-RegValue "HKLM:\$LocConsent" 'Value')"
+        "location_user=$(Get-RegValue "HKCU:\$LocConsent" 'Value')"
+        "location_desktop_apps=$(Get-RegValue "HKCU:\$LocConsent\NonPackaged" 'Value')"
     )
     $file = Join-Path $script:BackupDir 'settings-snapshot.txt'
     $lines | Out-File -FilePath $file -Encoding utf8
@@ -533,19 +584,134 @@ function Set-TargetLanguage {
     if (Get-Command Copy-UserInternationalSettingsToSystem -ErrorAction SilentlyContinue) {
         try { Copy-UserInternationalSettingsToSystem -WelcomeScreen $true -NewUser $true } catch { }
     }
-    # 没装英文显示语言包的话，界面文字仍然是中文：有管理员权限就直接装上。
-    if (Get-Command Get-InstalledLanguage -ErrorAction SilentlyContinue) {
-        $hasEn = $false
-        try { $hasEn = [bool](Get-InstalledLanguage -Language 'en-US' -ErrorAction Stop) } catch { }
-        if (-not $hasEn) {
-            Write-Log '系统还没有英文显示语言包，正在下载安装（需要联网，可能要几分钟）…'
-            try { Install-Language -Language 'en-US' -ErrorAction Stop | Out-Null; Write-Log '英文语言包已安装。' }
-            catch {
-                Write-Note "英文语言包安装失败（$($_.Exception.Message)）。界面文字会继续显示中文；可到 设置 > 时间和语言 > 语言和区域 手动添加 English (United States)。"
+    if ($results -notcontains $false) { Write-Log '语言 / 区域已设为 en-US，键盘只保留美式键盘；注销或重启后生效。' }
+}
+
+# 英文显示语言包是不是已经装好（只有输入法 / 基本输入功能不算）。
+function Test-EnPackInstalled {
+    try {
+        $l = @(Get-InstalledLanguage -Language 'en-US' -ErrorAction Stop)
+        if ($l.Count -eq 0 -or $null -eq $l[0]) { return $false }
+        if ($l[0].PSObject.Properties['LanguagePacks']) {
+            $packs = [string]$l[0].LanguagePacks
+            return ($packs -and $packs -ne 'None' -and $packs -ne '0')
+        }
+        return $true
+    } catch { return $false }
+}
+
+# 没装英文显示语言包的话，界面文字仍然是中文：自动下载安装。
+# Install-Language 在网络不通 / Windows 更新卡住时会一直不返回，所以放到后台做并限时：
+# 整个脚本的最后一步才做（其余项目先完成），超时或按 S 就不再等。
+function Install-EnglishPack {
+    if (-not $script:DoLang) { return }
+    if (-not (Get-Command Get-InstalledLanguage -ErrorAction SilentlyContinue)) { return }   # Windows 10 没有这组命令
+    if (-not (Get-Command Install-Language -ErrorAction SilentlyContinue)) { return }
+    if (Test-EnPackInstalled) { $script:LangPackState = 'ok'; return }
+    if ($DryRun) {
+        Write-Log "（演练）系统还没有英文显示语言包：会在最后下载安装，最多等 $LangPackTimeoutMin 分钟"
+        return
+    }
+    $manual = '可到 设置 > 时间和语言 > 语言和区域 手动添加 English (United States)，或稍后重新运行本脚本'
+    # 只装显示语言包，不带语音、手写、OCR 这些附加功能：下载量小很多，也更不容易卡住。
+    $lite = $false
+    try { $lite = (Get-Command Install-Language).Parameters.ContainsKey('ExcludeFeatures') } catch { }
+    Write-Log "系统还没有英文显示语言包，正在下载安装（需要联网；最多等 $LangPackTimeoutMin 分钟，按 S 可以跳过不等）…"
+    $job = $null
+    try {
+        $job = Start-Job -ArgumentList $lite -ScriptBlock {
+            param($lite)
+            $ErrorActionPreference = 'Stop'
+            $ProgressPreference = 'SilentlyContinue'
+            if ($lite) { Install-Language -Language 'en-US' -ExcludeFeatures | Out-Null }
+            else { Install-Language -Language 'en-US' | Out-Null }
+        }
+    } catch {
+        $script:LangPackState = "没有装上（$($_.Exception.Message)）；$manual"
+        Write-Note "英文显示语言包$($script:LangPackState)"
+        return
+    }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $limit = $LangPackTimeoutMin * 60
+    $nextReport = 30
+    $skipped = $false
+    while ($job.State -eq 'Running' -and $sw.Elapsed.TotalSeconds -lt $limit) {
+        Wait-Job -Job $job -Timeout 2 | Out-Null
+        # 没有真正的控制台（输出被重定向）时读按键会抛异常，忽略即可。
+        try {
+            while ([Console]::KeyAvailable) {
+                if ([Console]::ReadKey($true).Key -eq 'S') { $skipped = $true }
             }
+        } catch { }
+        if ($skipped) { break }
+        if ($sw.Elapsed.TotalSeconds -ge $nextReport) {
+            Write-Log ("  英文语言包还在下载安装，已等 {0} 秒（最多等 {1} 秒，按 S 跳过）…" -f [int]$sw.Elapsed.TotalSeconds, $limit)
+            $nextReport += 30
         }
     }
-    if ($results -notcontains $false) { Write-Log '语言 / 区域已设为 en-US，键盘只保留美式键盘；注销或重启后生效。' }
+    $state = $job.State
+    $err = ''
+    if ($state -ne 'Running') {
+        try { Receive-Job -Job $job -ErrorAction Stop | Out-Null } catch { $err = $_.Exception.Message }
+    }
+    try { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } catch { }
+
+    if (Test-EnPackInstalled) {
+        $script:LangPackState = 'ok'
+        Write-Log '英文显示语言包已安装。'
+    } elseif ($state -eq 'Running') {
+        $why = if ($skipped) { '已按 S 跳过' } else { "等了 $LangPackTimeoutMin 分钟还没下载完，不再等待" }
+        $script:LangPackState = "没有装上（$why；多半是网络连不上 Windows 更新）。界面文字会继续显示中文；$manual"
+        Write-Note "英文显示语言包$($script:LangPackState)"
+    } else {
+        if (-not $err) { $err = '安装命令结束了，但系统里仍然没有英文显示语言包' }
+        $script:LangPackState = "没有装上（$err）。界面文字会继续显示中文；$manual"
+        Write-Note "英文显示语言包$($script:LangPackState)"
+    }
+}
+
+# ------------------------------------------------------------------- 定位
+
+# 系统「定位服务」总开关、当前用户的「允许应用访问位置」、「允许桌面应用访问位置」是不是都关了。
+function Test-LocSystemOff { return ((Get-RegValue "HKLM:\$LocConsent" 'Value') -eq 'Deny') }
+function Test-LocUserOff { return ((Get-RegValue "HKCU:\$LocConsent" 'Value') -eq 'Deny') }
+function Test-LocDesktopOff { return ((Get-RegValue "HKCU:\$LocConsent\NonPackaged" 'Value') -eq 'Deny') }
+function Test-LocOff { return ((Test-LocSystemOff) -and (Test-LocUserOff) -and (Test-LocDesktopOff)) }
+
+function Set-LocConsentDeny([string]$Hive, [string]$Sub) {
+    $path = "${Hive}:\$LocConsent$Sub"
+    if (-not (Test-Path -LiteralPath $path)) { New-Item -Path $path -Force -ErrorAction Stop | Out-Null }
+    Set-ItemProperty -LiteralPath $path -Name Value -Value 'Deny' -Type String -ErrorAction Stop
+}
+
+function Set-LocationOff {
+    if (-not $script:DoLoc) { return }
+    Write-Log '准备关闭系统定位服务…'
+    if ($DryRun) {
+        Write-Log '（演练）关闭「定位服务」总开关、「允许应用访问你的位置」和「允许桌面应用访问你的位置」'
+        return
+    }
+    $results = @(
+        (Invoke-Methods '关闭「定位服务」总开关' { Test-LocSystemOff } @(
+            { Set-LocConsentDeny 'HKLM' '' },
+            { Invoke-Native { reg.exe add "HKLM\$LocConsent" /v Value /t REG_SZ /d Deny /f } }
+        )),
+        (Invoke-Methods '关闭「允许应用访问你的位置」' { Test-LocUserOff } @(
+            { Set-LocConsentDeny 'HKCU' '' },
+            { Invoke-Native { reg.exe add "HKCU\$LocConsent" /v Value /t REG_SZ /d Deny /f } }
+        )),
+        (Invoke-Methods '关闭「允许桌面应用访问你的位置」' { Test-LocDesktopOff } @(
+            { Set-LocConsentDeny 'HKCU' '\NonPackaged' },
+            { Invoke-Native { reg.exe add "HKCU\$LocConsent\NonPackaged" /v Value /t REG_SZ /d Deny /f } }
+        ))
+    )
+    # 定位服务（lfsvc）自己记的开关也一起关掉，并把正在跑的服务停下来；这两步失败不算错。
+    try {
+        $cfg = 'HKLM:\SYSTEM\CurrentControlSet\Services\lfsvc\Service\Configuration'
+        if (Test-Path -LiteralPath $cfg) { Set-ItemProperty -LiteralPath $cfg -Name Status -Value 0 -Type DWord -ErrorAction Stop }
+    } catch { }
+    Stop-Service -Name lfsvc -Force -ErrorAction SilentlyContinue
+    if ($results -notcontains $false) { Write-Log '系统定位服务已关闭。' }
 }
 
 # ------------------------------------------------------- 安装 / 卸载 Claude
@@ -625,6 +791,8 @@ function Show-Status {
     $script:StatusBad = 0
     Write-StatusLine $tzMark "时区：$tz（目标 $TargetTz$auto）"
     Write-StatusLine $langMark "系统语言：$lang（目标 en-US）"
+    if (Test-LocOff) { Write-StatusLine '√' '系统定位：已关闭' }
+    else { Write-StatusLine '×' '系统定位：开着（目标 关闭）' }
     $cl = Get-ChromeLang
     if ($null -eq $cl) {
         Write-Host '  - Chrome：未检测到'
@@ -632,6 +800,9 @@ function Show-Status {
         $clMark = if ($cl -eq 'en-US') { '√' } else { '×' }
         if (-not $cl) { $cl = '未设置，跟随系统' }
         Write-StatusLine $clMark "Chrome 语言：$cl（目标 en-US）"
+        $geoOn = @(Get-ChromeGeoOnProfiles)
+        if ($geoOn.Count -eq 0) { Write-StatusLine '√' 'Chrome 定位：已关闭' }
+        else { Write-StatusLine '×' "Chrome 定位：这些个人资料还开着：$($geoOn -join '、')（目标 关闭）" }
     }
     $code = if ((Get-Command claude -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $env:USERPROFILE '.local\bin\claude.exe'))) { '已安装' } else { '未安装' }
     $desktop = if (Test-Path (Join-Path $env:LOCALAPPDATA 'AnthropicClaude')) { '已安装' } else { '未检测到' }
@@ -640,7 +811,7 @@ function Show-Status {
 }
 
 # 执行后逐项核对「选中的项目」有没有真的达到目标；没达到的记为未通过。
-function Show-Verify([bool]$WantCache, [bool]$WantHistory, [bool]$WantChrome, [bool]$WantTz, [bool]$WantLang) {
+function Show-Verify([bool]$WantCache, [bool]$WantHistory, [bool]$WantChrome, [bool]$WantTz, [bool]$WantLang, [bool]$WantLoc) {
     $failed = 0
     if ($WantTz) {
         if (Test-TzOk) { Add-Ok "时区：$(Get-CurrentTz)，「自动设置时区」已关闭" }
@@ -655,6 +826,16 @@ function Show-Verify([bool]$WantCache, [bool]$WantHistory, [bool]$WantChrome, [b
         if (-not (Test-SystemLocaleOk)) { $bad += '系统区域设置' }
         if ($bad.Count -eq 0) { Add-Ok '系统语言 / 区域：en-US，键盘只剩美式键盘（注销或重启后完全生效）' }
         else { Add-Bad "系统语言 / 区域：这些还不是 en-US：$($bad -join '、')"; $failed++ }
+        if ($script:LangPackState -eq 'ok') { Add-Ok '英文显示语言包：已安装' }
+        elseif ($script:LangPackState) { Add-Bad "英文显示语言包：$($script:LangPackState)"; $failed++ }
+    }
+    if ($WantLoc) {
+        $bad = @()
+        if (-not (Test-LocSystemOff)) { $bad += '「定位服务」总开关' }
+        if (-not (Test-LocUserOff)) { $bad += '「允许应用访问你的位置」' }
+        if (-not (Test-LocDesktopOff)) { $bad += '「允许桌面应用访问你的位置」' }
+        if ($bad.Count -eq 0) { Add-Ok '系统定位：定位服务已关闭' }
+        else { Add-Bad "系统定位：这些还开着：$($bad -join '、')"; $failed++ }
     }
     if ($WantChrome) {
         if (-not (Test-Path -LiteralPath $ChromeData)) {
@@ -663,8 +844,10 @@ function Show-Verify([bool]$WantCache, [bool]$WantHistory, [bool]$WantChrome, [b
             Add-Bad 'Chrome：还在运行，没有彻底退出'; $failed++
         } elseif ((Get-ChromeLang) -ne 'en-US') {
             Add-Bad "Chrome 语言：当前是 $(Get-ChromeLang)，目标 en-US"; $failed++
+        } elseif (@(Get-ChromeGeoOnProfiles).Count -gt 0) {
+            Add-Bad "Chrome 定位：这些个人资料还没关掉：$(@(Get-ChromeGeoOnProfiles) -join '、')"; $failed++
         } else {
-            Add-Ok 'Chrome：已彻底退出，缓存已清理，语言 en-US'
+            Add-Ok 'Chrome：已彻底退出，缓存已清理，语言 en-US，定位已关闭'
         }
     }
     if ($WantCache) {
@@ -681,7 +864,7 @@ function Show-Verify([bool]$WantCache, [bool]$WantHistory, [bool]$WantChrome, [b
 }
 
 function Invoke-Pipeline {
-    if (-not ($script:DoCache -or $script:DoHistory -or $script:DoChrome -or $script:DoTz -or $script:DoLang)) {
+    if (-not ($script:DoCache -or $script:DoHistory -or $script:DoChrome -or $script:DoTz -or $script:DoLang -or $script:DoLoc)) {
         Write-Host '请至少选择一个执行项目。'; return
     }
     $script:BackupDir = Join-Path $DataDir ('backups\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
@@ -691,25 +874,29 @@ function Invoke-Pipeline {
     }
     # 记下用户选了什么，最后按这个逐项核对。
     $wantCache = $script:DoCache; $wantHistory = $script:DoHistory; $wantChrome = $script:DoChrome
-    $wantTz = $script:DoTz; $wantLang = $script:DoLang
+    $wantTz = $script:DoTz; $wantLang = $script:DoLang; $wantLoc = $script:DoLoc
+    $script:LangPackState = ''
 
     if ($script:DoTz -and -not $DryRun -and (Test-TzOk)) {
         Write-Log "时区已经是 $TargetTzName，无需修改。"
         $script:DoTz = $false
     }
-    if ($script:DoTz -or $script:DoLang) { Save-Snapshot }
+    if ($script:DoTz -or $script:DoLang -or $script:DoLoc) { Save-Snapshot }
 
     Set-TargetTimezone
     Set-TargetLanguage
+    Set-LocationOff
     Clear-Claude
     Clear-Chrome
+    # 英文语言包要联网下载，可能很慢甚至卡住：放在最后，其余项目都已经做完了。
+    Install-EnglishPack
 
     if ($DryRun) {
         Write-Skip "演练结束，没有做任何修改。预计可释放 $(Format-Size $script:FreedBytes)。"
         return
     }
     # 逐项核对的结果记进「执行结果」，由调用的地方统一打印。
-    $failed = Show-Verify $wantCache $wantHistory $wantChrome $wantTz $wantLang
+    $failed = Show-Verify $wantCache $wantHistory $wantChrome $wantTz $wantLang $wantLoc
     $script:Errors += $failed
     Add-Info "共释放 $(Format-Size $script:FreedBytes)"
     if ($wantLang) { Add-Info '提示：语言和键盘设置需要注销或重启 Windows 后才完全生效' }
@@ -718,7 +905,7 @@ function Invoke-Pipeline {
 function Show-Menu {
     while ($true) {
         $script:DoCache = $false; $script:DoHistory = $false; $script:DoChrome = $false
-        $script:DoTz = $false; $script:DoLang = $false
+        $script:DoTz = $false; $script:DoLang = $false; $script:DoLoc = $false
         $script:RemoveUserData = $false; $script:Errors = 0; $script:FreedBytes = [int64]0; $script:Removed = 0
         $script:Results.Clear(); $script:OkCount = 0; $script:BadCount = 0
 
@@ -728,10 +915,11 @@ function Show-Menu {
         Write-Host ''
         Write-Host '  1) 清理 Claude Code 缓存、日志、临时文件'
         Write-Host '  2) 清理 Claude Code 会话历史（不可恢复）'
-        Write-Host '  3) 清理 Chrome 缓存，并把 Chrome 语言设为 en-US'
+        Write-Host '  3) 清理 Chrome 缓存，把 Chrome 语言设为 en-US，并关闭 Chrome 定位'
         Write-Host "  4) 时区改为 $TargetTzName"
         Write-Host '  5) 系统语言 / 区域改为 en-US，键盘只留美式键盘'
-        Write-Host '  a) 一键执行 1 3 4 5（推荐）'
+        Write-Host '  6) 关闭系统定位服务'
+        Write-Host '  a) 一键执行 1 3 4 5 6（推荐）'
         Write-Host '  i) 安装 Claude Code        u) 卸载 Claude Code'
         Write-Host '  I) 安装 Claude Desktop     U) 卸载 Claude Desktop'
         Write-Host '  q) 退出'
@@ -745,7 +933,8 @@ function Show-Menu {
             elseif ($c -eq '3') { $script:DoChrome = $true; $picked = $true }
             elseif ($c -eq '4') { $script:DoTz = $true; $picked = $true }
             elseif ($c -eq '5') { $script:DoLang = $true; $picked = $true }
-            elseif ($c -eq 'a') { $script:DoCache = $true; $script:DoChrome = $true; $script:DoTz = $true; $script:DoLang = $true; $picked = $true }
+            elseif ($c -eq '6') { $script:DoLoc = $true; $picked = $true }
+            elseif ($c -eq 'a') { $script:DoCache = $true; $script:DoChrome = $true; $script:DoTz = $true; $script:DoLang = $true; $script:DoLoc = $true; $picked = $true }
             elseif ($c -ceq 'i') { $act = 'install-code' }
             elseif ($c -ceq 'u') { $act = 'uninstall-code' }
             elseif ($c -ceq 'I') { $act = 'install-desktop' }
@@ -774,19 +963,20 @@ function Show-Usage {
 
 用法：
   双击 xiaochuan-env.bat                     交互菜单
-  xiaochuan-env.bat -All                     直接执行：清缓存 + Chrome + 时区 + 语言
+  xiaochuan-env.bat -All                     直接执行：清缓存 + Chrome + 时区 + 语言 + 关定位
   xiaochuan-env.bat -All -DryRun             演练，只显示将要做的事
-  xiaochuan-env.bat status                   检查当前状态（时区 / 语言 / Chrome 是否已达标）
+  xiaochuan-env.bat status                   检查当前状态（时区 / 语言 / 定位 / Chrome 是否已达标）
   xiaochuan-env.bat install-code | uninstall-code [-RemoveData]
   xiaochuan-env.bat install-desktop | uninstall-desktop
 
 选项：
   -Cache       清理 Claude Code 缓存、日志、临时文件
   -History     清理 Claude Code 会话历史（不可恢复）
-  -Chrome      清理 Chrome 缓存，并把 Chrome 语言设为 en-US
+  -Chrome      清理 Chrome 缓存，把 Chrome 语言设为 en-US，并关闭 Chrome 定位
   -Timezone    时区改为 $TargetTzName
   -Language    系统语言 / 区域改为 en-US，键盘只留美式键盘
-  -All         等于 -Cache -Chrome -Timezone -Language（不含 -History）
+  -Location    关闭系统定位服务
+  -All         等于 -Cache -Chrome -Timezone -Language -Location（不含 -History）
   -DryRun      演练：只显示将要做的事，不做任何修改
   -Force       Claude Code 在运行时也继续清理
   -Yes         不再逐项确认
@@ -799,12 +989,13 @@ function Show-Usage {
 
 if ($Help) { Show-Usage; exit 0 }
 
-if ($All) { $Cache = $true; $Chrome = $true; $Timezone = $true; $Language = $true }
+if ($All) { $Cache = $true; $Chrome = $true; $Timezone = $true; $Language = $true; $Location = $true }
 $script:DoCache = [bool]$Cache
 $script:DoHistory = [bool]$History
 $script:DoChrome = [bool]$Chrome
 $script:DoTz = [bool]$Timezone
 $script:DoLang = [bool]$Language
+$script:DoLoc = [bool]$Location
 
 # 除了「演练」和「查看状态」，其余全部在管理员权限下执行：只弹一次 UAC。
 $needAdmin = -not $DryRun -and $Action -ne 'status'
@@ -843,7 +1034,7 @@ try {
             Show-Status
             Write-Host '=========================================='
             if ($script:StatusBad -eq 0) {
-                Write-Host ' 结果：时区、语言都已达标 ' -ForegroundColor White -BackgroundColor DarkGreen
+                Write-Host ' 结果：时区、语言、定位都已达标 ' -ForegroundColor White -BackgroundColor DarkGreen
             } else {
                 Write-Host " 结果：有 $($script:StatusBad) 项还没达标（上面标 × 的红色行） " -ForegroundColor White -BackgroundColor Red
                 $script:Errors += $script:StatusBad
@@ -854,7 +1045,7 @@ try {
         'install-desktop' { Install-Desktop }
         'uninstall-desktop' { Uninstall-Desktop }
         default {
-            if ($script:DoCache -or $script:DoHistory -or $script:DoChrome -or $script:DoTz -or $script:DoLang) { Invoke-Pipeline }
+            if ($script:DoCache -or $script:DoHistory -or $script:DoChrome -or $script:DoTz -or $script:DoLang -or $script:DoLoc) { Invoke-Pipeline }
             else { $showResult = $false; Show-Menu }
         }
     }
@@ -865,7 +1056,7 @@ try {
 if ($showResult) { Show-Result }
 
 # 提权后是新开的窗口，结束前停一下，免得结果一闪而过。
-if ($Elevated -and ($Action -or $script:DoCache -or $script:DoHistory -or $script:DoChrome -or $script:DoTz -or $script:DoLang -or $script:Errors)) {
+if ($Elevated -and ($Action -or $script:DoCache -or $script:DoHistory -or $script:DoChrome -or $script:DoTz -or $script:DoLang -or $script:DoLoc -or $script:Errors)) {
     Write-Host ''
     Read-Host '按回车关闭窗口' | Out-Null
 }
