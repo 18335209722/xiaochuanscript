@@ -2,6 +2,7 @@
 # 功能和 XiaochuanEnv.exe / macOS、Linux 版 xiaochuan-env.sh 对齐：
 #   清理 Claude Code 缓存 / 会话历史、清理 Chrome 缓存并设为 en-US、
 #   时区改为太平洋时间（America/Los_Angeles）、系统语言改为 en-US、关闭系统定位和 Chrome 定位、
+#   关闭系统 IPv6、
 #   安装 / 卸载 Claude。
 # 兼容 Windows 自带的 PowerShell 5.1。本文件必须保存为「UTF-8 带 BOM」，否则中文会乱码。
 
@@ -15,6 +16,7 @@ param(
     [switch]$Timezone,
     [switch]$Language,
     [switch]$Location,
+    [switch]$IPv6,
     [switch]$All,
     [switch]$DryRun,
     [switch]$Force,
@@ -27,7 +29,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Version = '1.2.0'
+$Version = '1.3.0'
 $TargetTz = 'Pacific Standard Time'          # 即 America/Los_Angeles
 $TargetTzName = 'America/Los_Angeles'
 
@@ -38,6 +40,8 @@ $ChromeData = Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data'
 $TzAutoKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\tzautoupdate'
 # 「定位服务」总开关（设置 > 隐私和安全性 > 位置）：Value 为 Deny 表示关。
 $LocConsent = 'SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location'
+# IPv6 的系统级开关：DisabledComponents 的低 8 位全为 1（0xFF）表示全部关闭，重启后生效。
+$Ip6Key = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters'
 # 英文显示语言包最多等这么久；超时就不再等，其余项目照常完成。
 $LangPackTimeoutMin = 15
 
@@ -51,6 +55,7 @@ $script:DoChrome = $false
 $script:DoTz = $false
 $script:DoLang = $false
 $script:DoLoc = $false
+$script:DoIp6 = $false
 $script:LangPackState = ''
 $script:RemoveUserData = [bool]$RemoveData
 
@@ -470,6 +475,8 @@ function Save-Snapshot {
         "home_location=$((Get-WinHomeLocation).GeoId)"
         "location_system=$(Get-RegValue "HKLM:\$LocConsent" 'Value')"
         "location_user=$(Get-RegValue "HKCU:\$LocConsent" 'Value')"
+        "ipv6_disabled_components=$(Get-RegValue $Ip6Key 'DisabledComponents')"
+        "ipv6_adapters_on=$(@(Get-Ip6OnAdapters) -join ',')"
         "location_desktop_apps=$(Get-RegValue "HKCU:\$LocConsent\NonPackaged" 'Value')"
     )
     $file = Join-Path $script:BackupDir 'settings-snapshot.txt'
@@ -642,7 +649,8 @@ function Install-EnglishPack {
     $limit = $LangPackTimeoutMin * 60
     $nextReport = 30
     $skipped = $false
-    while ($job.State -eq 'Running' -and $sw.Elapsed.TotalSeconds -lt $limit) {
+    $busy = 'NotStarted', 'Running'
+    while ($busy -contains [string]$job.State -and $sw.Elapsed.TotalSeconds -lt $limit) {
         Wait-Job -Job $job -Timeout 2 | Out-Null
         # 没有真正的控制台（输出被重定向）时读按键会抛异常，忽略即可。
         try {
@@ -656,9 +664,9 @@ function Install-EnglishPack {
             $nextReport += 30
         }
     }
-    $state = $job.State
+    $running = ($busy -contains [string]$job.State)
     $err = ''
-    if ($state -ne 'Running') {
+    if (-not $running) {
         try { Receive-Job -Job $job -ErrorAction Stop | Out-Null } catch { $err = $_.Exception.Message }
     }
     try { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } catch { }
@@ -666,7 +674,7 @@ function Install-EnglishPack {
     if (Test-EnPackInstalled) {
         $script:LangPackState = 'ok'
         Write-Log '英文显示语言包已安装。'
-    } elseif ($state -eq 'Running') {
+    } elseif ($running) {
         $why = if ($skipped) { '已按 S 跳过' } else { "等了 $LangPackTimeoutMin 分钟还没下载完，不再等待；多半是网络连不上 Windows 更新" }
         $script:LangPackState = "没有装上（$why）。界面文字会继续显示中文；$manual"
         Write-Note "英文显示语言包$($script:LangPackState)"
@@ -726,6 +734,50 @@ function Set-LocationOff {
     } catch { }
     Stop-Service -Name lfsvc -Force -ErrorAction SilentlyContinue
     if ($results -notcontains $false) { Write-Log '系统定位服务已关闭。' }
+}
+
+# ------------------------------------------------------------------- IPv6
+
+# 系统级开关是不是已经关了（重启后对所有网卡和隧道生效）。
+function Test-Ip6RegOff {
+    $v = Get-RegValue $Ip6Key 'DisabledComponents'
+    if ($null -eq $v) { return $false }
+    return (([int64]$v -band 0xFF) -eq 0xFF)
+}
+
+# 还开着 IPv6 的网卡（名字）；没有这组命令或都关了则返回空。
+function Get-Ip6OnAdapters {
+    try {
+        return @(Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction Stop |
+            Where-Object { $_.Enabled } | ForEach-Object { $_.Name })
+    } catch { return @() }
+}
+
+# 关闭 IPv6：先在每块网卡上取消「Internet 协议版本 6」（马上生效），
+# 再写系统级开关（重启后生效，以后新增的网卡 / 隧道也不会再有 IPv6）。
+function Set-Ip6Off {
+    if (-not $script:DoIp6) { return }
+    Write-Log '准备关闭系统 IPv6…'
+    if ($DryRun) {
+        Write-Log '（演练）在所有网卡上取消「Internet 协议版本 6 (TCP/IPv6)」，并把系统级开关 DisabledComponents 设为 0xFF（重启后生效）'
+        return
+    }
+    $results = @(
+        (Invoke-Methods '关闭各网卡上的 IPv6' { @(Get-Ip6OnAdapters).Count -eq 0 } @(
+            { Disable-NetAdapterBinding -Name '*' -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction Stop },
+            {
+                # 整批关有网卡报错时，逐块网卡再关一遍。
+                foreach ($n in @(Get-Ip6OnAdapters)) {
+                    try { Disable-NetAdapterBinding -Name $n -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction Stop } catch { }
+                }
+            }
+        )),
+        (Invoke-Methods '关闭 IPv6 的系统级开关' { Test-Ip6RegOff } @(
+            { Set-ItemProperty -Path $Ip6Key -Name DisabledComponents -Value 255 -Type DWord -ErrorAction Stop },
+            { Invoke-Native { reg.exe add 'HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' /v DisabledComponents /t REG_DWORD /d 255 /f } }
+        ))
+    )
+    if ($results -notcontains $false) { Write-Log '系统 IPv6 已关闭（各网卡马上生效；系统级开关重启后生效）。' }
 }
 
 # ------------------------------------------------------- 安装 / 卸载 Claude
@@ -808,6 +860,10 @@ function Show-Status {
     $locOn = @(Get-LocOnParts)
     if ($locOn.Count -eq 0) { Write-StatusLine '√' '系统定位：已关闭' }
     else { Write-StatusLine '×' "系统定位：这些还开着：$($locOn -join '、')（目标 全部关闭）" }
+    $ip6On = @(Get-Ip6OnAdapters)
+    if ($ip6On.Count -gt 0) { Write-StatusLine '×' "系统 IPv6：这些网卡还开着：$($ip6On -join '、')（目标 关闭）" }
+    elseif (-not (Test-Ip6RegOff)) { Write-StatusLine '×' '系统 IPv6：各网卡已关，但系统级开关还没关（目标 关闭）' }
+    else { Write-StatusLine '√' '系统 IPv6：已关闭' }
     $cl = Get-ChromeLang
     if ($null -eq $cl) {
         Write-Host '  - Chrome：未检测到'
@@ -826,7 +882,7 @@ function Show-Status {
 }
 
 # 执行后逐项核对「选中的项目」有没有真的达到目标；没达到的记为未通过。
-function Show-Verify([bool]$WantCache, [bool]$WantHistory, [bool]$WantChrome, [bool]$WantTz, [bool]$WantLang, [bool]$WantLoc) {
+function Show-Verify([bool]$WantCache, [bool]$WantHistory, [bool]$WantChrome, [bool]$WantTz, [bool]$WantLang, [bool]$WantLoc, [bool]$WantIp6) {
     $failed = 0
     if ($WantTz) {
         if (Test-TzOk) { Add-Ok "时区：$(Get-CurrentTz)，「自动设置时区」已关闭" }
@@ -848,6 +904,12 @@ function Show-Verify([bool]$WantCache, [bool]$WantHistory, [bool]$WantChrome, [b
         $bad = @(Get-LocOnParts)
         if ($bad.Count -eq 0) { Add-Ok '系统定位：定位服务已关闭' }
         else { Add-Bad "系统定位：这些还开着：$($bad -join '、')"; $failed++ }
+    }
+    if ($WantIp6) {
+        $ip6On = @(Get-Ip6OnAdapters)
+        if ($ip6On.Count -gt 0) { Add-Bad "系统 IPv6：这些网卡还开着：$($ip6On -join '、')"; $failed++ }
+        elseif (-not (Test-Ip6RegOff)) { Add-Bad '系统 IPv6：系统级开关（DisabledComponents）没改成'; $failed++ }
+        else { Add-Ok '系统 IPv6：已关闭（各网卡马上生效；系统级开关重启后生效）' }
     }
     if ($WantChrome) {
         $geoOn = @()
@@ -878,7 +940,7 @@ function Show-Verify([bool]$WantCache, [bool]$WantHistory, [bool]$WantChrome, [b
 }
 
 function Invoke-Pipeline {
-    if (-not ($script:DoCache -or $script:DoHistory -or $script:DoChrome -or $script:DoTz -or $script:DoLang -or $script:DoLoc)) {
+    if (-not ($script:DoCache -or $script:DoHistory -or $script:DoChrome -or $script:DoTz -or $script:DoLang -or $script:DoLoc -or $script:DoIp6)) {
         Write-Host '请至少选择一个执行项目。'; return
     }
     $script:BackupDir = Join-Path $DataDir ('backups\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
@@ -888,18 +950,19 @@ function Invoke-Pipeline {
     }
     # 记下用户选了什么，最后按这个逐项核对。
     $wantCache = $script:DoCache; $wantHistory = $script:DoHistory; $wantChrome = $script:DoChrome
-    $wantTz = $script:DoTz; $wantLang = $script:DoLang; $wantLoc = $script:DoLoc
+    $wantTz = $script:DoTz; $wantLang = $script:DoLang; $wantLoc = $script:DoLoc; $wantIp6 = $script:DoIp6
     $script:LangPackState = ''
 
     if ($script:DoTz -and -not $DryRun -and (Test-TzOk)) {
         Write-Log "时区已经是 $TargetTzName，无需修改。"
         $script:DoTz = $false
     }
-    if ($script:DoTz -or $script:DoLang -or $script:DoLoc) { Save-Snapshot }
+    if ($script:DoTz -or $script:DoLang -or $script:DoLoc -or $script:DoIp6) { Save-Snapshot }
 
     Set-TargetTimezone
     Set-TargetLanguage
     Set-LocationOff
+    Set-Ip6Off
     Clear-Claude
     Clear-Chrome
     # 英文语言包要联网下载，可能很慢甚至卡住：放在最后，其余项目都已经做完了。
@@ -910,16 +973,17 @@ function Invoke-Pipeline {
         return
     }
     # 逐项核对的结果记进「执行结果」，由调用的地方统一打印。
-    $failed = Show-Verify $wantCache $wantHistory $wantChrome $wantTz $wantLang $wantLoc
+    $failed = Show-Verify $wantCache $wantHistory $wantChrome $wantTz $wantLang $wantLoc $wantIp6
     $script:Errors += $failed
     Add-Info "共释放 $(Format-Size $script:FreedBytes)"
     if ($wantLang) { Add-Info '提示：语言和键盘设置需要注销或重启 Windows 后才完全生效' }
+    if ($wantIp6) { Add-Info '提示：IPv6 的系统级开关需要重启 Windows 后才完全生效' }
 }
 
 function Show-Menu {
     while ($true) {
         $script:DoCache = $false; $script:DoHistory = $false; $script:DoChrome = $false
-        $script:DoTz = $false; $script:DoLang = $false; $script:DoLoc = $false
+        $script:DoTz = $false; $script:DoLang = $false; $script:DoLoc = $false; $script:DoIp6 = $false
         $script:RemoveUserData = $false; $script:Errors = 0; $script:FreedBytes = [int64]0; $script:Removed = 0
         $script:Results.Clear(); $script:OkCount = 0; $script:BadCount = 0
 
@@ -933,7 +997,8 @@ function Show-Menu {
         Write-Host "  4) 时区改为 $TargetTzName"
         Write-Host '  5) 系统语言 / 区域改为 en-US，键盘只留美式键盘'
         Write-Host '  6) 关闭系统定位服务'
-        Write-Host '  a) 一键执行 1 3 4 5 6（推荐）'
+        Write-Host '  7) 关闭系统 IPv6'
+        Write-Host '  a) 一键执行 1 3 4 5 6 7（推荐）'
         Write-Host '  i) 安装 Claude Code        u) 卸载 Claude Code'
         Write-Host '  I) 安装 Claude Desktop     U) 卸载 Claude Desktop'
         Write-Host '  q) 退出'
@@ -948,7 +1013,8 @@ function Show-Menu {
             elseif ($c -eq '4') { $script:DoTz = $true; $picked = $true }
             elseif ($c -eq '5') { $script:DoLang = $true; $picked = $true }
             elseif ($c -eq '6') { $script:DoLoc = $true; $picked = $true }
-            elseif ($c -eq 'a') { $script:DoCache = $true; $script:DoChrome = $true; $script:DoTz = $true; $script:DoLang = $true; $script:DoLoc = $true; $picked = $true }
+            elseif ($c -eq '7') { $script:DoIp6 = $true; $picked = $true }
+            elseif ($c -eq 'a') { $script:DoCache = $true; $script:DoChrome = $true; $script:DoTz = $true; $script:DoLang = $true; $script:DoLoc = $true; $script:DoIp6 = $true; $picked = $true }
             elseif ($c -ceq 'i') { $act = 'install-code' }
             elseif ($c -ceq 'u') { $act = 'uninstall-code' }
             elseif ($c -ceq 'I') { $act = 'install-desktop' }
@@ -977,9 +1043,9 @@ function Show-Usage {
 
 用法：
   双击 xiaochuan-env.bat                     交互菜单
-  xiaochuan-env.bat -All                     直接执行：清缓存 + Chrome + 时区 + 语言 + 关定位
+  xiaochuan-env.bat -All                     直接执行：清缓存 + Chrome + 时区 + 语言 + 关定位 + 关 IPv6
   xiaochuan-env.bat -All -DryRun             演练，只显示将要做的事
-  xiaochuan-env.bat status                   检查当前状态（时区 / 语言 / 定位 / Chrome 是否已达标）
+  xiaochuan-env.bat status                   检查当前状态（时区 / 语言 / 定位 / IPv6 / Chrome 是否已达标）
   xiaochuan-env.bat install-code | uninstall-code [-RemoveData]
   xiaochuan-env.bat install-desktop | uninstall-desktop
 
@@ -990,7 +1056,8 @@ function Show-Usage {
   -Timezone    时区改为 $TargetTzName
   -Language    系统语言 / 区域改为 en-US，键盘只留美式键盘
   -Location    关闭系统定位服务
-  -All         等于 -Cache -Chrome -Timezone -Language -Location（不含 -History）
+  -IPv6        关闭系统 IPv6（各网卡马上生效，系统级开关重启后生效）
+  -All         等于 -Cache -Chrome -Timezone -Language -Location -IPv6（不含 -History）
   -DryRun      演练：只显示将要做的事，不做任何修改
   -Force       Claude Code 在运行时也继续清理
   -Yes         不再逐项确认
@@ -1003,13 +1070,14 @@ function Show-Usage {
 
 if ($Help) { Show-Usage; exit 0 }
 
-if ($All) { $Cache = $true; $Chrome = $true; $Timezone = $true; $Language = $true; $Location = $true }
+if ($All) { $Cache = $true; $Chrome = $true; $Timezone = $true; $Language = $true; $Location = $true; $IPv6 = $true }
 $script:DoCache = [bool]$Cache
 $script:DoHistory = [bool]$History
 $script:DoChrome = [bool]$Chrome
 $script:DoTz = [bool]$Timezone
 $script:DoLang = [bool]$Language
 $script:DoLoc = [bool]$Location
+$script:DoIp6 = [bool]$IPv6
 
 # 除了「演练」和「查看状态」，其余全部在管理员权限下执行：只弹一次 UAC。
 $needAdmin = -not $DryRun -and $Action -ne 'status'
@@ -1048,7 +1116,7 @@ try {
             Show-Status
             Write-Host '=========================================='
             if ($script:StatusBad -eq 0) {
-                Write-Host ' 结果：时区、语言、定位都已达标 ' -ForegroundColor White -BackgroundColor DarkGreen
+                Write-Host ' 结果：时区、语言、定位、IPv6 都已达标 ' -ForegroundColor White -BackgroundColor DarkGreen
             } else {
                 Write-Host " 结果：有 $($script:StatusBad) 项还没达标（上面标 × 的红色行） " -ForegroundColor White -BackgroundColor Red
                 $script:Errors += $script:StatusBad
@@ -1059,7 +1127,7 @@ try {
         'install-desktop' { Install-Desktop }
         'uninstall-desktop' { Uninstall-Desktop }
         default {
-            if ($script:DoCache -or $script:DoHistory -or $script:DoChrome -or $script:DoTz -or $script:DoLang -or $script:DoLoc) { Invoke-Pipeline }
+            if ($script:DoCache -or $script:DoHistory -or $script:DoChrome -or $script:DoTz -or $script:DoLang -or $script:DoLoc -or $script:DoIp6) { Invoke-Pipeline }
             else { $showResult = $false; Show-Menu }
         }
     }
@@ -1070,7 +1138,7 @@ try {
 if ($showResult) { Show-Result }
 
 # 提权后是新开的窗口，结束前停一下，免得结果一闪而过。
-if ($Elevated -and ($Action -or $script:DoCache -or $script:DoHistory -or $script:DoChrome -or $script:DoTz -or $script:DoLang -or $script:DoLoc -or $script:Errors)) {
+if ($Elevated -and ($Action -or $script:DoCache -or $script:DoHistory -or $script:DoChrome -or $script:DoTz -or $script:DoLang -or $script:DoLoc -or $script:DoIp6 -or $script:Errors)) {
     Write-Host ''
     Read-Host '按回车关闭窗口' | Out-Null
 }

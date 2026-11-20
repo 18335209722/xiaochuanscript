@@ -1,4 +1,4 @@
-小川环境助手 · macOS / Linux 版 1.2.0 · 使用说明
+小川环境助手 · macOS / Linux 版 1.3.0 · 使用说明
 
 运行（macOS 和 Linux 是同一个脚本，会自动识别系统）：
   macOS：在访达里双击 xiaochuan-env.command 即可打开菜单。
@@ -6,7 +6,7 @@
          如果提示没有权限，在终端执行一次：chmod +x xiaochuan-env.command
   终端：
     bash xiaochuan-env.sh                    交互菜单（输入 a 一键执行）
-    bash xiaochuan-env.sh --all              直接执行：清缓存 + Chrome + 时区 + 语言 + 关定位
+    bash xiaochuan-env.sh --all              直接执行：清缓存 + Chrome + 时区 + 语言 + 关定位 + 关 IPv6
     bash xiaochuan-env.sh --all --dry-run    演练，只显示将要做的事
     bash xiaochuan-env.sh status             检查当前状态
     bash xiaochuan-env.sh --help             全部参数
@@ -21,7 +21,8 @@
   4. 修改时区为 America/Los_Angeles（--timezone）
   5. 修改系统语言/区域为 en-US，并清空键盘布局只留美式键盘（--language）
   6. 关闭系统定位服务（--location）
-  7. 安装 / 卸载 Claude Code 和 Claude Desktop
+  7. 关闭系统 IPv6（--ipv6）
+  8. 安装 / 卸载 Claude Code 和 Claude Desktop
      （install-code / uninstall-code / install-desktop / uninstall-desktop）
 
 状态检查：
@@ -48,7 +49,11 @@
     Linux 是 GNOME 的「定位服务」开关，并屏蔽 GeoClue 定位服务
     （恢复：sudo systemctl unmask geoclue.service）。
     新版 macOS 可能不让脚本改这个开关：这时「执行结果」里会标红，请按提示手动关闭。
-  - 关闭 Chrome 定位 = chrome://settings/content/location 改成「不允许网站查看我的位置」，
+  - 关闭系统 IPv6：macOS 是把每个网络服务（Wi-Fi、以太网…）的「配置 IPv6」设为「关闭」
+    （恢复：sudo networksetup -setv6automatic "Wi-Fi"，或到 系统设置 > 网络 里改回「自动」）；
+    Linux 是用 sysctl 马上关掉，并写 /etc/sysctl.d/99-xiaochuan-disable-ipv6.conf 让重启后仍然关闭
+    （恢复：删掉这个文件后重启）。关闭后只走 IPv4，只支持 IPv6 的网站 / 网络会连不上。
+  - 关闭 Chrome 定位 =chrome://settings/content/location 改成「不允许网站查看我的位置」，
     以前单独允许过定位的网站也会一并清掉；每个个人资料都会改。
   - Claude Code 必须完全退出，否则拒绝清理（可加 --force 跳过检查）。
   - Chrome 在运行时会先自动把它关闭（先正常退出，标签页下次可恢复；退不掉再强制结束），
@@ -66,5 +71,5 @@
 备份位置：
   ~/.xiaochuan-env/backups/<时间>/
     chrome-files/           修改前的 Chrome Local State 和 Preferences
-    settings-snapshot.txt   修改前的时区、语言、键盘布局和定位开关
+    settings-snapshot.txt   修改前的时区、语言、键盘布局、定位开关和 IPv6 状态
     keyboard/               修改前的输入法配置文件

@@ -3,10 +3,10 @@
 # 功能对齐 Windows 版 XiaochuanEnv 1.0.0：
 #   清理 Claude Code 缓存 / 会话历史、清理 Chrome 缓存并设为 en-US、
 #   时区改为 America/Los_Angeles、系统语言改为 en-US、关闭系统定位和 Chrome 定位、
-#   安装 / 卸载 Claude。
+#   关闭系统 IPv6、安装 / 卸载 Claude。
 # 兼容 macOS 自带的 bash 3.2：不使用关联数组、mapfile、${var,,} 等新语法。
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 TARGET_TZ="America/Los_Angeles"
 
 case "$(uname -s)" in
@@ -54,7 +54,10 @@ DO_CHROME=0
 DO_TZ=0
 DO_LANG=0
 DO_LOC=0
+DO_IP6=0
 ACTION=""
+# Linux 上让「关闭 IPv6」重启后仍然有效的配置文件。
+IP6_SYSCTL_FILE="/etc/sysctl.d/99-xiaochuan-disable-ipv6.conf"
 
 ERRORS=0
 VERIFY_FAILED=0
@@ -559,6 +562,13 @@ snapshot_settings() {
         echo "time=$(date)"
         echo "timezone=$(current_tz)"
         echo "location=$(loc_state)"
+        echo "ipv6=$(ip6_state)"
+        if [ "$OS" = "mac" ]; then
+            echo "ipv6_services_on=$(ip6_on_services_mac | tr '\n' ',')"
+        else
+            echo "ipv6_all_disable=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)"
+            echo "ipv6_default_disable=$(cat /proc/sys/net/ipv6/conf/default/disable_ipv6 2>/dev/null)"
+        fi
         if [ "$OS" = "mac" ]; then
             echo "AppleLanguages=$(defaults read -g AppleLanguages 2>/dev/null | tr -d '\n')"
             echo "AppleLocale=$(defaults read -g AppleLocale 2>/dev/null)"
@@ -875,6 +885,86 @@ set_location() {
     log "系统定位服务已关闭。"
 }
 
+# ------------------------------------------------------------------- IPv6
+
+# macOS：还开着 IPv6 的网络服务（Wi-Fi、以太网…），每行一个；已停用的服务不算。
+ip6_on_services_mac() {
+    local svc
+    networksetup -listallnetworkservices 2>/dev/null | sed '1d' | grep -v '^\*' | while IFS= read -r svc; do
+        [ -n "$svc" ] || continue
+        networksetup -getinfo "$svc" 2>/dev/null | grep -q '^IPv6: Off' || printf '%s\n' "$svc"
+    done
+}
+
+# 系统 IPv6 的状态：输出 off / on。
+ip6_state() {
+    if [ "$OS" = "mac" ]; then
+        if [ -z "$(ip6_on_services_mac)" ]; then echo off; else echo on; fi
+        return 0
+    fi
+    # 内核里根本没有 IPv6（模块被禁用）也算关闭。
+    if [ ! -d /proc/sys/net/ipv6 ]; then echo off; return 0; fi
+    if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = "1" ] \
+        && [ "$(cat /proc/sys/net/ipv6/conf/default/disable_ipv6 2>/dev/null)" = "1" ]; then
+        echo off
+    else
+        echo on
+    fi
+}
+
+# macOS：把每个网络服务的 IPv6 都设为「关闭」。
+disable_ip6_mac() {
+    local svc list
+    list="$(ip6_on_services_mac)"
+    # 列表走 3 号描述符，免得 sudo 把它当成输入读走。
+    while IFS= read -r svc <&3; do
+        [ -n "$svc" ] || continue
+        run_root networksetup -setv6off "$svc" >/dev/null 2>&1
+    done 3<<IP6_EOF
+$list
+IP6_EOF
+    [ "$(ip6_state)" = "off" ]
+}
+
+# Linux：马上关掉（sysctl），并写配置文件让重启后仍然是关的。
+disable_ip6_linux() {
+    run_root mkdir -p "$(dirname "$IP6_SYSCTL_FILE")" >/dev/null 2>&1
+    run_root sh -c "printf '%s\n' '# xiaochuan-env: disable IPv6' 'net.ipv6.conf.all.disable_ipv6 = 1' 'net.ipv6.conf.default.disable_ipv6 = 1' > '$IP6_SYSCTL_FILE'" \
+        || warn "没写成 $IP6_SYSCTL_FILE，重启后 IPv6 可能又会打开。"
+    run_root sysctl -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1
+    if [ "$(ip6_state)" != "off" ]; then
+        run_root sh -c 'echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6; echo 1 > /proc/sys/net/ipv6/conf/default/disable_ipv6' >/dev/null 2>&1
+    fi
+    [ "$(ip6_state)" = "off" ]
+}
+
+set_ip6() {
+    [ "$DO_IP6" = "1" ] || return 0
+    log "准备关闭系统 IPv6…"
+    if [ "$DRY_RUN" = "1" ]; then
+        if [ "$OS" = "mac" ]; then
+            log "（演练）把每个网络服务（Wi-Fi、以太网…）的 IPv6 设为「关闭」"
+        else
+            log "（演练）用 sysctl 关闭 IPv6，并写 $IP6_SYSCTL_FILE 让重启后仍然关闭"
+        fi
+        return 0
+    fi
+    if [ "$(ip6_state)" = "off" ]; then
+        log "系统 IPv6 已经是关闭的，无需修改。"
+        return 0
+    fi
+    if [ "$OS" = "mac" ]; then
+        if ! disable_ip6_mac; then
+            fail "系统 IPv6 没关掉，这些网络服务还开着：$(ip6_on_services_mac | tr '\n' ' ')；请到 系统设置 > 网络 > 详细信息 > TCP/IP 把「配置 IPv6」改成「关闭」。"
+            return 1
+        fi
+    elif ! disable_ip6_linux; then
+        fail "系统 IPv6 没关掉（需要管理员权限）。"
+        return 1
+    fi
+    log "系统 IPv6 已关闭。"
+}
+
 # ------------------------------------------------------- 安装 / 卸载 Claude
 
 install_code() {
@@ -1000,6 +1090,11 @@ status() {
         on) status_line "✗" "系统定位：开着（目标 关闭）" ;;
         *) echo "  - 系统定位：现在读不到（要管理员权限）；执行「关闭系统定位」后会核对" ;;
     esac
+    if [ "$(ip6_state)" = "off" ]; then
+        status_line "✓" "系统 IPv6：已关闭"
+    else
+        status_line "✗" "系统 IPv6：开着（目标 关闭）"
+    fi
     if [ -f "$CHROME_DATA/Local State" ]; then
         cl="$(chrome_lang)"
         [ "$cl" = "en-US" ] && c_ok="✓"
@@ -1020,7 +1115,7 @@ status() {
 # 执行后逐项核对「选中的项目」有没有真的达到目标；没达到的记为失败。
 verify_results() {
     local want_cache="$1" want_history="$2" want_chrome="$3" want_tz="$4" want_lang="$5" want_loc="$6"
-    local item left cl geo_on
+    local want_ip6="$7" item left cl geo_on
     if [ "$want_tz" = "1" ]; then
         if tz_ok; then
             ok_item "时区：$(current_tz)"
@@ -1047,6 +1142,14 @@ verify_results() {
                 bad_item "系统定位：无法确认是否已关闭，请到 系统设置 > 隐私与安全性 > 定位服务 看一下"
                 VERIFY_FAILED=$((VERIFY_FAILED + 1)) ;;
         esac
+    fi
+    if [ "$want_ip6" = "1" ]; then
+        if [ "$(ip6_state)" = "off" ]; then
+            ok_item "系统 IPv6：已关闭"
+        else
+            bad_item "系统 IPv6：还开着"
+            VERIFY_FAILED=$((VERIFY_FAILED + 1))
+        fi
     fi
     if [ "$want_chrome" = "1" ]; then
         if [ ! -d "$CHROME_DATA" ]; then
@@ -1095,7 +1198,7 @@ verify_results() {
 }
 
 run_pipeline() {
-    if [ "$DO_CACHE$DO_HISTORY$DO_CHROME$DO_TZ$DO_LANG$DO_LOC" = "000000" ]; then
+    if [ "$DO_CACHE$DO_HISTORY$DO_CHROME$DO_TZ$DO_LANG$DO_LOC$DO_IP6" = "0000000" ]; then
         echo "请至少选择一个执行项目。"
         return 1
     fi
@@ -1109,7 +1212,7 @@ run_pipeline() {
     fi
     # 记下用户选了什么，最后按这个逐项核对。
     local want_cache="$DO_CACHE" want_history="$DO_HISTORY" want_chrome="$DO_CHROME"
-    local want_tz="$DO_TZ" want_lang="$DO_LANG" want_loc="$DO_LOC"
+    local want_tz="$DO_TZ" want_lang="$DO_LANG" want_loc="$DO_LOC" want_ip6="$DO_IP6"
 
     # 一开始就拿管理员权限：时区、Linux 语言必须用；其余项目在普通方式失败时也会用它重试。
     if [ "$DRY_RUN" != "1" ] && [ "$(id -u)" != "0" ]; then
@@ -1124,7 +1227,7 @@ run_pipeline() {
         log "时区已经是 $TARGET_TZ，无需修改。"
         DO_TZ=0
     fi
-    if [ "$DO_TZ" = "1" ] || [ "$DO_LANG" = "1" ] || [ "$DO_LOC" = "1" ]; then
+    if [ "$DO_TZ" = "1" ] || [ "$DO_LANG" = "1" ] || [ "$DO_LOC" = "1" ] || [ "$DO_IP6" = "1" ]; then
         snapshot_settings
     fi
 
@@ -1132,6 +1235,7 @@ run_pipeline() {
     set_timezone
     set_language
     set_location
+    set_ip6
     clean_claude
     clean_chrome
 
@@ -1141,7 +1245,7 @@ run_pipeline() {
     fi
 
     # 逐项核对的结果记进「执行结果」，由调用的地方统一打印。
-    verify_results "$want_cache" "$want_history" "$want_chrome" "$want_tz" "$want_lang" "$want_loc"
+    verify_results "$want_cache" "$want_history" "$want_chrome" "$want_tz" "$want_lang" "$want_loc" "$want_ip6"
     info_item "共释放 $(human_kb "$FREED_KB")"
     if [ "$want_lang" = "1" ]; then
         info_item "提示：语言和键盘设置需要注销或重启电脑后才完全生效"
@@ -1152,7 +1256,7 @@ run_pipeline() {
 menu() {
     local c picked act choices
     while :; do
-        DO_CACHE=0; DO_HISTORY=0; DO_CHROME=0; DO_TZ=0; DO_LANG=0; DO_LOC=0
+        DO_CACHE=0; DO_HISTORY=0; DO_CHROME=0; DO_TZ=0; DO_LANG=0; DO_LOC=0; DO_IP6=0
         REMOVE_DATA=0; ERRORS=0; FREED_KB=0; REMOVED=0
         RESULTS=""; OK_COUNT=0; BAD_COUNT=0
         picked=0; act=""
@@ -1167,7 +1271,8 @@ menu() {
         echo "  4) 时区改为 $TARGET_TZ"
         echo "  5) 系统语言 / 区域改为 en-US，键盘布局只留美式键盘"
         echo "  6) 关闭系统定位服务"
-        echo "  a) 一键执行 1 3 4 5 6（推荐）"
+        echo "  7) 关闭系统 IPv6"
+        echo "  a) 一键执行 1 3 4 5 6 7（推荐）"
         echo "  i) 安装 Claude Code        u) 卸载 Claude Code"
         echo "  I) 安装 Claude Desktop     U) 卸载 Claude Desktop"
         echo "  q) 退出"
@@ -1188,7 +1293,8 @@ menu() {
                 4) DO_TZ=1; picked=1 ;;
                 5) DO_LANG=1; picked=1 ;;
                 6) DO_LOC=1; picked=1 ;;
-                a|A) DO_CACHE=1; DO_CHROME=1; DO_TZ=1; DO_LANG=1; DO_LOC=1; picked=1 ;;
+                7) DO_IP6=1; picked=1 ;;
+                a|A) DO_CACHE=1; DO_CHROME=1; DO_TZ=1; DO_LANG=1; DO_LOC=1; DO_IP6=1; picked=1 ;;
                 i) act="install_code" ;;
                 u) act="uninstall_code" ;;
                 I) act="install_desktop" ;;
@@ -1227,7 +1333,7 @@ usage() {
 用法：
   bash $0                  交互菜单（不带参数）
   bash $0 [选项]           按选项直接执行
-  bash $0 status           检查当前状态（时区 / 语言 / 定位 / Chrome 是否已达标）
+  bash $0 status           检查当前状态（时区 / 语言 / 定位 / IPv6 / Chrome 是否已达标）
   bash $0 install-code     安装 Claude Code
   bash $0 uninstall-code [--remove-data]
   bash $0 install-desktop  安装 Claude Desktop（仅 macOS）
@@ -1240,7 +1346,8 @@ usage() {
   --timezone     时区改为 $TARGET_TZ
   --language     系统语言 / 区域改为 en-US，并清空键盘布局只留美式键盘
   --location     关闭系统定位服务
-  --all          等于 --cache --chrome --timezone --language --location（不含 --history）
+  --ipv6         关闭系统 IPv6
+  --all          等于 --cache --chrome --timezone --language --location --ipv6（不含 --history）
   --dry-run      演练：只显示将要做的事，不做任何修改
   --force        Claude Code 在运行时也继续清理
   -y, --yes      不再逐项确认
@@ -1258,7 +1365,8 @@ while [ $# -gt 0 ]; do
         --timezone) DO_TZ=1 ;;
         --language) DO_LANG=1 ;;
         --location) DO_LOC=1 ;;
-        --all) DO_CACHE=1; DO_CHROME=1; DO_TZ=1; DO_LANG=1; DO_LOC=1 ;;
+        --ipv6) DO_IP6=1 ;;
+        --all) DO_CACHE=1; DO_CHROME=1; DO_TZ=1; DO_LANG=1; DO_LOC=1; DO_IP6=1 ;;
         --dry-run) DRY_RUN=1 ;;
         --force) FORCE=1 ;;
         --remove-data) REMOVE_DATA=1 ;;
@@ -1280,7 +1388,7 @@ case "$ACTION" in
         status
         echo "=========================================="
         if [ "$STATUS_BAD" = "0" ]; then
-            printf '%s 结果：时区、语言、定位都已达标 %s\n' "$C_OK_BAR" "$C_OFF"
+            printf '%s 结果：时区、语言、定位、IPv6 都已达标 %s\n' "$C_OK_BAR" "$C_OFF"
         else
             printf '%s 结果：有 %s 项还没达标（上面标 ✗ 的红色行） %s\n' "$C_BAD_BAR" "$STATUS_BAD" "$C_OFF"
         fi
@@ -1288,7 +1396,7 @@ case "$ACTION" in
         exit $?
         ;;
     "")
-        if [ "$DO_CACHE$DO_HISTORY$DO_CHROME$DO_TZ$DO_LANG$DO_LOC" != "000000" ]; then
+        if [ "$DO_CACHE$DO_HISTORY$DO_CHROME$DO_TZ$DO_LANG$DO_LOC$DO_IP6" != "0000000" ]; then
             run_pipeline
         elif [ -t 0 ]; then
             # 菜单里每执行完一次都会打印「执行结果」，这里不用再打印。
