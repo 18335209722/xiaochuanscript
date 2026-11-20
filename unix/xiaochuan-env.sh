@@ -519,15 +519,31 @@ current_tz() {
     fi
 }
 
-# macOS「自动设置时区」开关：1 开，0 关，空表示读不到。
+# 「自动设置时区」开关：1 开，0 关，空表示读不到 / 这个系统没有这个开关。
+# macOS 是系统设置里的开关；Linux 是 GNOME 桌面的「自动时区」。
 auto_tz() {
-    defaults read /Library/Preferences/com.apple.timezone.auto Active 2>/dev/null
+    if [ "$OS" = "mac" ]; then
+        defaults read /Library/Preferences/com.apple.timezone.auto Active 2>/dev/null
+        return 0
+    fi
+    command -v gsettings >/dev/null 2>&1 || return 0
+    case "$(gsettings get org.gnome.desktop.datetime automatic-timezone 2>/dev/null)" in
+        true) echo 1 ;;
+        false) echo 0 ;;
+    esac
 }
 
-# 时区已经达标（mac 上还要求「自动设置时区」是关的）。
+# 关闭 Linux（GNOME）的「自动时区」；没有这个开关时什么也不用做。
+disable_auto_tz_linux() {
+    [ "$(auto_tz)" = "1" ] || return 0
+    gsettings set org.gnome.desktop.datetime automatic-timezone false >/dev/null 2>&1
+    [ "$(auto_tz)" != "1" ]
+}
+
+# 时区已经达标（还要求「自动设置时区」是关的）。
 tz_ok() {
     [ "$(current_tz)" = "$TARGET_TZ" ] || return 1
-    if [ "$OS" = "mac" ] && [ "$(auto_tz)" = "1" ]; then
+    if [ "$(auto_tz)" = "1" ]; then
         return 1
     fi
     return 0
@@ -566,6 +582,7 @@ snapshot_settings() {
         if [ "$OS" = "mac" ]; then
             echo "ipv6_services_on=$(ip6_on_services_mac | tr '\n' ',')"
         else
+            echo "auto_timezone=$(auto_tz)"
             echo "ipv6_all_disable=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)"
             echo "ipv6_default_disable=$(cat /proc/sys/net/ipv6/conf/default/disable_ipv6 2>/dev/null)"
         fi
@@ -646,6 +663,8 @@ set_timezone() {
         methods="systemsetup link relink"
         # 先关掉「自动设置时区」，否则会被定位改回去。
         disable_auto_tz_mac
+    else
+        disable_auto_tz_linux
     fi
     # 一种方式不行就换下一种；命令的返回值不可靠，每次都看时区实际有没有变。
     for m in $methods; do
@@ -667,10 +686,16 @@ set_timezone() {
             fail "时区已改为 $TARGET_TZ，但「自动设置时区」关不掉，之后会被改回去；请到 系统设置 > 通用 > 日期与时间 手动关闭。"
             return 1
         fi
-    elif [ -f /etc/timezone ]; then
-        run_root sh -c "echo $TARGET_TZ > /etc/timezone"
+    else
+        if [ -f /etc/timezone ]; then
+            run_root sh -c "echo $TARGET_TZ > /etc/timezone"
+        fi
+        if ! disable_auto_tz_linux; then
+            fail "时区已改为 $TARGET_TZ，但「自动时区」关不掉，之后会被改回去；请到 设置 > 日期和时间 手动关闭「自动时区」。"
+            return 1
+        fi
     fi
-    log "时区已设为 $TARGET_TZ，现在是 $(date '+%Y-%m-%d %H:%M %Z')。"
+    log "时区已设为 $TARGET_TZ，「自动设置时区」已关闭，现在是 $(date '+%Y-%m-%d %H:%M %Z')。"
 }
 
 lang_ok() {
@@ -1076,7 +1101,7 @@ status() {
     tz="$(current_tz)"
     lang="$(current_lang)"
     [ "$tz" = "$TARGET_TZ" ] && t_ok="✓"
-    if [ "$OS" = "mac" ] && [ "$(auto_tz)" = "1" ]; then
+    if [ "$(auto_tz)" = "1" ]; then
         auto="；「自动设置时区」开着，会被改回去"
         t_ok="✗"
     fi
@@ -1118,9 +1143,9 @@ verify_results() {
     local want_ip6="$7" item left cl geo_on
     if [ "$want_tz" = "1" ]; then
         if tz_ok; then
-            ok_item "时区：$(current_tz)"
+            ok_item "时区：$(current_tz)，「自动设置时区」已关闭"
         else
-            bad_item "时区：当前是 $(current_tz)，目标 $TARGET_TZ"
+            bad_item "时区：当前是 $(current_tz)，目标 $TARGET_TZ（并且要关闭「自动设置时区」）"
             VERIFY_FAILED=$((VERIFY_FAILED + 1))
         fi
     fi
