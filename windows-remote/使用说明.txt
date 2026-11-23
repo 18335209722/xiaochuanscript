@@ -1,0 +1,121 @@
+小川远程助手 · Windows 版 1.0.0 · 使用说明
+
+只有一个脚本：xiaochuan-remote.bat + xiaochuan-remote.ps1（两个文件要放在同一个目录）。
+和 windows 目录里的 xiaochuan-env.bat、after-reboot.bat 互不影响。
+
+作用：
+  双击一次，把「远程用命令行操作这台 Windows 电脑」要做的事全做完。之后就能从别的电脑
+  （Termius、或者 Windows / macOS / Linux 的 ssh 命令）登录这台电脑，登录进来是 PowerShell，
+  并且可以直接输入 claude 使用 Claude 命令行。
+
+  一次做七件事：
+    1. 安装 OpenSSH 服务端（Windows 自带的可选功能）。已经装了就跳过。
+       系统自带的装不上时（比如 Windows 更新被禁用），自动改从 GitHub 官方
+       （https://github.com/PowerShell/Win32-OpenSSH）下载安装包安装。
+    2. 启动 sshd 服务，并设为开机自动启动（重启电脑之后不用再执行本脚本）。
+    3. Windows 防火墙放行 SSH 端口（默认 TCP 22，专用 / 公用网络都放行）。
+    4. 登录设置：把远程登录后的命令行设为 PowerShell（不再是 cmd）；
+       按参数可选：写入公钥、给账户设密码、启用 Administrator、打开密码登录。
+    5. 登录检查：列出本机账户，指出该用哪个账户登录、哪些账户登录会被拒；
+       检查 sshd 配置有没有挡住登录。这一步只看不改。
+    6. 安装 Claude 命令行（Claude Code），并加进 PATH，命令窗口里直接输入 claude 就能用。
+    7. 检查 SSH 端口确实通了，并显示从别的电脑连接要用的命令。
+
+  重复执行没有副作用：已经做好的步骤会直接跳过或保持原样。
+
+运行：
+  双击 xiaochuan-remote.bat             全部做完；用 Windows 账户的密码登录
+  xiaochuan-remote.bat -Status          只查看现在的状态和连接命令，不做任何修改
+  xiaochuan-remote.bat -DryRun          演练：只显示将要做的事，不做任何修改
+  xiaochuan-remote.bat -Off             关闭 SSH：停止 sshd 服务并删除防火墙规则
+  xiaochuan-remote.bat -Help            显示说明
+
+  登录相关的参数（可以和上面的一起用）：
+    -PubKey "ssh-ed25519 AAAA... 备注"  写入公钥，可以免密码登录（也可以给 .pub 文件的路径）
+    -ForUser 账户名                     公钥写给哪个账户（默认是当前登录的账户）
+    -SetPassword 账户名                 给这个账户设登录密码（会提示输入两遍）
+    -EnableAdmin                        启用内置 Administrator 账户（Windows 默认是禁用的）
+    -AllowPassword                      sshd 配置把密码登录关掉了的话，重新打开
+    -Shell cmd                          远程登录后的命令行恢复为 cmd
+    -Shell keep                         不改动远程登录后的命令行
+    -Shell powershell                   强制设为 PowerShell（之前手动设成别的 shell 时用）
+
+  Claude 命令行相关的参数：
+    -NoClaude                           不安装 Claude 命令行
+    -ClaudeOnly                         只安装 Claude 命令行，不动 SSH（不需要管理员权限，不弹 UAC）
+    -UpdateClaude                       已经装了的话，升级到最新版
+
+  不需要手动「以管理员身份运行」。执行时 Windows 会弹一次 UAC，点「是」，之后在新开的窗口里执行。
+
+怎么连接：
+  执行完之后，窗口里会列出连接命令，形如：
+      ssh 用户名@192.168.1.23
+  - Termius：新建主机，地址填窗口里显示的 IP，端口 22，用户名和密码填 Windows 的账户名和登录密码。
+  - 别的电脑的终端：输入上面那条命令，再输入密码。只想远程执行一条命令的话，把命令写在后面：
+        ssh 用户名@192.168.1.23 hostname
+  - 用户名：登录 Windows 的那个账户名（窗口里会显示）。
+  - 密码：这个 Windows 账户的登录密码。用微软账户登录 Windows 的，是微软账户的密码，不是 PIN 码。
+  - 192.168 / 10 开头的地址只有在同一个局域网（同一个路由器 / WiFi）里才能连。
+    两台电脑不在同一个网络时，可以两边都装 Tailscale 之类的组网软件，用 100 开头的那个地址连。
+  - 电脑睡眠或关机时连不上。需要长期远程的话，在「设置 > 系统 > 电源」里把睡眠改成「从不」。
+
+登录进来是 PowerShell：
+  Windows 的 SSH 默认登录进来是 cmd，本脚本默认把它换成 PowerShell（提示符是 PS C:\Users\用户名>）。
+  - 对所有通过 SSH 登录这台电脑的账户都生效；不影响在这台电脑上本地打开的命令窗口。
+  - 已经连着的会话不会变，要断开重新登录。
+  - 之前手动设成了别的 shell（比如 PowerShell 7、Git Bash）的话，脚本不会覆盖；
+    要强制换成 PowerShell 用 -Shell powershell，想改回 cmd 用 -Shell cmd。
+
+连得上但是登录被拒（Permission denied / Connection closed）：
+  看第 5 步「登录检查」里黄色的「注意」，常见原因和对应的办法：
+  - 用的是 Administrator：Windows 默认把这个账户禁用了。改用窗口里列出的账户名；
+    一定要用它的话加 -EnableAdmin，再加 -SetPassword Administrator 给它设密码。
+  - 账户没有密码：没有密码的账户不能用密码登录。加 -SetPassword 账户名 设一个，或者用 -PubKey。
+  - sshd 配置把密码登录关掉了：加 -AllowPassword（会先备份原来的 sshd_config）。
+  - sshd 配置里有 AllowUsers / DenyUsers 之类的名单：脚本只提示，不会改，要手动改
+    C:\ProgramData\ssh\sshd_config。
+
+免密码登录（公钥）：
+  在「要连过来的那台电脑」上执行 ssh-keygen -t ed25519（一路回车），
+  然后把 ~/.ssh/id_ed25519.pub 这个文件里的那一行内容拿过来，在这台电脑上执行：
+      xiaochuan-remote.bat -PubKey "ssh-ed25519 AAAA... 备注"
+  Termius 里生成的密钥，把它的公钥（Public key）复制过来也一样。
+  - 要用的是公钥。私钥不能给别人，脚本发现给的是私钥会拒绝。
+  - 可以多次执行来加多个公钥；同一个公钥不会重复写入。
+  - 公钥写在 用户目录\.ssh\authorized_keys；账户是管理员时还会写到
+    C:\ProgramData\ssh\administrators_authorized_keys（管理员登录时 sshd 只认这个文件），并设好它要求的权限。
+
+Claude 命令行：
+  用的是 Anthropic 官方安装脚本（https://claude.ai/install.ps1），装到 用户目录\.local\bin\claude.exe，
+  官方脚本会核对安装包的校验值（SHA-256）。官方安装脚本用不了、而电脑上有 npm（Node.js）时，
+  改用 npm install -g @anthropic-ai/claude-code。已经装了就跳过。
+  - 装完怎么用：新开一个命令窗口（SSH / Termius 远程登录的要断开重新登录），
+    用 cd 进到要干活的目录，输入 claude。
+  - 第一次用要登录 Claude 账户。远程登录时这台电脑弹不出浏览器：把屏幕上显示的网址复制到
+    自己电脑的浏览器里打开，登录后把网页给的代码粘贴回命令窗口。
+  - 常用命令：claude --version 看版本；claude update 升级；claude -p "问题" 只问一句就退出。
+  - 网络：安装时要能访问 claude.ai 和 downloads.claude.ai（安装包 200 多 MB）；
+    使用时要能访问 Anthropic 的服务。装不上的时候最常见的原因就是网络，
+    这时 SSH 那几步照样会做完，网络调好后执行 xiaochuan-remote.bat -ClaudeOnly 再装一次。
+  - Claude 只装给执行脚本的这个 Windows 用户。弹 UAC 时用的是另一个管理员账户的话，
+    脚本不会替你装，要在自己的命令窗口里执行 xiaochuan-remote.bat -ClaudeOnly。
+  - 没有装 Git for Windows 也能用。启动 claude 时如果提示需要 git-bash，
+    到 https://git-scm.com/download/win 装一下。
+  - 卸载：删除 用户目录\.local\bin\claude.exe 和 用户目录\.local\share\claude 这个目录
+    （npm 装的用 npm uninstall -g @anthropic-ai/claude-code）。
+
+执行结果：
+  执行的最后有一份「执行结果」：完成的项目是绿色 √；没有完成的项目用红色高亮，并写着「没有完成」。
+  最后一行是总结果：全部完成是绿底，有没完成的是红底，并写明有几行没有完成。
+
+其他说明：
+  - 除了加 -AllowPassword 的时候，脚本不会修改 sshd 的配置文件（C:\ProgramData\ssh\sshd_config）。
+    那里面改过端口的话，防火墙放行的和显示的连接命令都会用改过之后的端口。
+  - 防火墙规则名叫 Xiaochuan-SSH-In-TCP。只处理 Windows 自带的防火墙；
+    装了别的安全软件（360、火绒等）并且拦截了入站连接的话，要在那个软件里另外放行。
+  - 从 GitHub 下载的 OpenSSH 安装包，要有微软的有效数字签名、或者和 GitHub 官方公布的校验值（SHA-256）
+    一致才会安装；镜像下载的文件同样要通过这个检查。
+  - -Off 只是停止 sshd 服务并删除防火墙规则，不会卸载 OpenSSH 和 Claude，也不会删除写入过的公钥；
+    再执行一次 xiaochuan-remote.bat 就能重新打开。
+  - 打开 SSH 之后，知道这台电脑账户密码的人就能远程登录它。请给 Windows 账户设一个不容易猜到的密码，
+    不需要远程的时候用 -Off 关掉。电脑有公网 IP 的话，建议只用公钥登录或者走 Tailscale。
