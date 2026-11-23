@@ -21,6 +21,12 @@ param(
     [string]$SetPassword = '',   # 给这个账户设登录密码（会提示输入两遍）；密码登录必须有密码
     [switch]$EnableAdmin,        # 启用内置 Administrator 账户（Windows 默认把它禁用了）
     [switch]$AllowPassword,      # 在 sshd_config 里打开密码登录并重启 sshd
+    [switch]$ReverseTunnel,      # 开启反向隧道：谁 SSH 登录进来，这台电脑就自动反向连回那台机器建端口转发隧道
+    [string]$ReverseUser = '',   # 反向连回去时用的对端账户名（配合 -ReverseTunnel）
+    [string]$ReverseKey = '',    # 反向连回去时用的免密私钥文件路径（配合 -ReverseTunnel）
+    [string]$ReverseMap = '2022:localhost:22',  # 反向隧道的端口映射（ssh -R 的参数）：对端端口:本机能到的主机:端口
+    [int]$ReverseClientPort = 22,# 对端 SSH 服务端的端口（默认 22）
+    [switch]$ReverseOff,         # 关闭反向隧道功能
     [switch]$NoClaude,           # 不安装 Claude 命令行
     [switch]$ClaudeOnly,         # 只安装 Claude 命令行，不动 SSH（不需要管理员权限）
     [switch]$UpdateClaude,       # Claude 命令行已经装了的话，升级到最新版
@@ -53,6 +59,12 @@ $ClaudeInstallUrl = 'https://claude.ai/install.ps1'
 $ClaudeNpmPackage = '@anthropic-ai/claude-code'
 $ClaudeBinDir = Join-Path $env:USERPROFILE '.local\bin'
 $ClaudeExe = Join-Path $ClaudeBinDir 'claude.exe'
+# 反向隧道：登录进来时跑的工作脚本、PowerShell 全局配置、本机的 SSH 客户端
+$ReverseWorker = Join-Path $SshData 'xiaochuan-reverse.ps1'
+$SshClientExe = Join-Path $env:WINDIR 'System32\OpenSSH\ssh.exe'
+$ProfilePath = Join-Path (Split-Path $PsExe -Parent) 'profile.ps1'
+$ReverseBegin = '# >>> xiaochuan-remote reverse >>>'
+$ReverseEnd = '# <<< xiaochuan-remote reverse <<<'
 
 $script:StepNo = 0
 $script:TotalSteps = 0
@@ -749,6 +761,108 @@ function Invoke-Claude([string]$User) {
     Show-ClaudeUsage
 }
 
+# ================================================================ 反向隧道：登录进来后自动连回来源机器
+
+# 生成「登录进来时跑的工作脚本」。配置（账户 / 私钥 / 端口映射 / 对端端口）直接写死在里面，
+# 要改就重新运行本脚本。里面读 $env:SSH_CONNECTION 拿到来源 IP，再用私钥 ssh -R 反向连回去。
+function Write-ReverseWorker([string]$User, [string]$Key, [string]$Map, [int]$CPort) {
+    $tpl = @'
+# 本文件由「小川远程助手」(xiaochuan-remote) 自动生成：SSH 登录进来时会运行它。
+# 它读出「是谁连进来的」（SSH 来源 IP），自动反向连回那台机器，建立一条反向隧道（端口转发 ssh -R）。
+# 不要手动改这里；要改配置或关闭，请重新运行 xiaochuan-remote.bat（-ReverseTunnel ... 或 -ReverseOff）。
+if (-not $env:SSH_CONNECTION) { return }
+$client = ($env:SSH_CONNECTION -split '\s+')[0]
+if (-not $client) { return }
+$ruser = '@USER@'
+$rkey  = '@KEY@'
+$rmap  = '@MAP@'
+$rport = @CPORT@
+$ssh = Join-Path $env:WINDIR 'System32\OpenSSH\ssh.exe'
+if (-not (Test-Path -LiteralPath $ssh)) {
+    $c = Get-Command ssh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($c) { $ssh = $c.Source } else { return }
+}
+# 去重：已经有连到这个来源 IP、同样端口映射的反向隧道就不再开。
+try {
+    $busy = Get-CimInstance Win32_Process -Filter "Name='ssh.exe'" -ErrorAction Stop |
+        Where-Object { $_.CommandLine -and $_.CommandLine -like "*-R $rmap*" -and $_.CommandLine -like "*@$client*" }
+    if ($busy) { return }
+} catch { }
+$sshArgs = @(
+    '-F', 'none', '-i', $rkey, '-p', "$rport", '-N', '-R', $rmap,
+    '-o', 'StrictHostKeyChecking=accept-new',
+    '-o', 'ExitOnForwardFailure=yes',
+    '-o', 'ServerAliveInterval=30',
+    '-o', 'ServerAliveCountMax=3',
+    '-o', 'BatchMode=yes',
+    ("{0}@{1}" -f $ruser, $client)
+)
+try { Start-Process -FilePath $ssh -ArgumentList $sshArgs -WindowStyle Hidden } catch { }
+'@
+    $tpl = $tpl.Replace('@USER@', $User).Replace('@KEY@', $Key).Replace('@MAP@', $Map).Replace('@CPORT@', "$CPort")
+    [IO.File]::WriteAllText($ReverseWorker, $tpl, (New-Object Text.UTF8Encoding($true)))
+}
+
+# 在 PowerShell 全局配置（profile.ps1，对所有账户的 PowerShell 生效）里加 / 去掉触发那段。
+# 用一对 ASCII 标记框住，改写时先删旧的再加新的，不动用户自己的其它内容。
+function Set-ReverseHook([bool]$Enable) {
+    $lines = @()
+    if (Test-Path -LiteralPath $ProfilePath) { $lines = @([IO.File]::ReadAllLines($ProfilePath)) }
+    $out = New-Object System.Collections.ArrayList
+    $skip = $false
+    foreach ($l in $lines) {
+        if ($l.Trim() -eq $ReverseBegin) { $skip = $true; continue }
+        if ($l.Trim() -eq $ReverseEnd) { $skip = $false; continue }
+        if (-not $skip) { [void]$out.Add($l) }
+    }
+    if ($Enable) {
+        [void]$out.Add($ReverseBegin)
+        [void]$out.Add('if ($env:SSH_CONNECTION -and (Test-Path -LiteralPath ''' + $ReverseWorker + ''')) {')
+        [void]$out.Add('    try { & ''' + $ReverseWorker + ''' } catch { }')
+        [void]$out.Add('}')
+        [void]$out.Add($ReverseEnd)
+    }
+    $text = ($out -join "`r`n")
+    if ($text.Trim()) { $text += "`r`n" }
+    $dir = Split-Path $ProfilePath -Parent
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    [IO.File]::WriteAllText($ProfilePath, $text, (New-Object Text.UTF8Encoding($true)))
+}
+
+function Invoke-Reverse {
+    Write-Step '反向隧道（登录进来后自动连回来源机器）'
+    if (-not $ReverseUser) { Write-Fail '开启反向隧道要用 -ReverseUser 指定「连回去时用的对端账户名」。'; return }
+    if (-not $ReverseKey) { Write-Fail '开启反向隧道要用 -ReverseKey 指定「连回去时用的免密私钥文件」。'; return }
+    $keyPath = $ReverseKey
+    try { if (Test-Path -LiteralPath $ReverseKey) { $keyPath = (Resolve-Path -LiteralPath $ReverseKey).Path } } catch { }
+    if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) { Write-Fail "找不到私钥文件：$ReverseKey"; return }
+    if (-not (Test-Path -LiteralPath $SshClientExe) -and -not (Get-Command ssh.exe -CommandType Application -ErrorAction SilentlyContinue)) {
+        Write-Note '这台电脑没有 OpenSSH 客户端（ssh.exe），反向连接会用不了。到 设置 > 系统 > 可选功能 里装「OpenSSH 客户端」。'
+    }
+    if ($DryRun) {
+        Write-Log "演练：将会生成 $ReverseWorker，并在 PowerShell 全局配置 $ProfilePath 里加一段。"
+        Write-Log "      之后每次有人 SSH 登录进来，这台电脑都会用私钥反向连回来源 IP（$ReverseUser@来源IP:$ReverseClientPort），建立反向隧道 -R $ReverseMap。"
+        return
+    }
+    try {
+        Write-ReverseWorker $ReverseUser $keyPath $ReverseMap $ReverseClientPort
+        Set-ReverseHook $true
+        Add-Ok "反向隧道已开启：有人 SSH 登录进来后，自动用 $ReverseUser@来源IP:$ReverseClientPort 反向连回并建立隧道 -R $ReverseMap"
+        Write-Note '隧道在有人登录进来时建立、连接断开后自动结束。要关掉这个功能用 -ReverseOff。'
+        Write-Note '对端那台机器要在跑 SSH 服务端、并且认得这把私钥；来源 IP 必须是这台电脑能直接连到的（同局域网或 Tailscale）。'
+    } catch { Write-Fail "反向隧道没有设置成功：$($_.Exception.Message)" }
+}
+
+function Invoke-ReverseOff {
+    Write-Step '关闭反向隧道'
+    if ($DryRun) { Write-Log "演练：将会从 $ProfilePath 删掉那段，并删除 $ReverseWorker。"; return }
+    try {
+        Set-ReverseHook $false
+        Remove-Item -LiteralPath $ReverseWorker -Force -ErrorAction SilentlyContinue
+        Add-Ok '反向隧道已关闭（已经在跑的隧道，等本次连接断开后就不在了）'
+    } catch { Write-Fail "反向隧道没有关掉：$($_.Exception.Message)" }
+}
+
 # ================================================================ 第 7 步：检查并显示连接方式
 
 function Get-LocalIPv4 {
@@ -834,6 +948,15 @@ function Show-Status {
         elseif ($sh) { Write-Host "  - 远程登录后的命令行：$sh" }
         else { Write-Host '  - 远程登录后的命令行：cmd（Windows 默认；再执行一次本脚本会换成 PowerShell）' }
     }
+    if (Test-Path -LiteralPath $ReverseWorker) {
+        Write-Host '  √ 反向隧道：已开启（有人 SSH 登录进来后自动连回来源机器建隧道）' -ForegroundColor Green
+        try {
+            $rt = @(Get-CimInstance Win32_Process -Filter "Name='ssh.exe'" -ErrorAction Stop | Where-Object { $_.CommandLine -like '*-R *' })
+            if ($rt.Count) { Write-Host "    当前有 $($rt.Count) 条反向隧道在跑" }
+        } catch { }
+    } else {
+        Write-Host '  - 反向隧道：没有开启'
+    }
     $claude = Find-Claude
     if (-not $claude) {
         Write-Host '  × Claude 命令行：没有安装' -ForegroundColor Red; $bad++
@@ -904,6 +1027,13 @@ if ($Help) {
   -AllowPassword                        sshd 配置把密码登录关掉了的话，重新打开
   -Shell cmd | keep | powershell        远程登录后的命令行：恢复 cmd / 不改动 / 强制设为 PowerShell
 
+反向隧道（谁 SSH 登录进来，这台电脑就自动反向连回那台机器建端口转发隧道）：
+  -ReverseTunnel -ReverseUser 对端账户 -ReverseKey 私钥文件路径 [-ReverseMap 对端端口:主机:端口] [-ReverseClientPort 对端SSH端口]
+                                        开启。例：-ReverseTunnel -ReverseUser jie -ReverseKey C:\Users\chai\.ssh\id_ed25519
+                                        默认映射 2022:localhost:22（对端 localhost:2022 → 本机 22）
+  -ReverseOff                           关闭反向隧道功能
+  （对端要在跑 SSH 服务端、认得这把私钥；来源 IP 要是本机能直接连到的，比如同局域网或 Tailscale。）
+
 Claude 命令行相关：
   -NoClaude                             不安装 Claude 命令行
   -ClaudeOnly                           只安装 Claude 命令行，不动 SSH（不需要管理员权限）
@@ -948,18 +1078,23 @@ if ($DryRun) { Write-Log '演练模式：只显示将要做的事，不做任何
 try {
     if ($Off) {
         Invoke-Off
+    } elseif ($ReverseOff) {
+        $script:TotalSteps = 1
+        Invoke-ReverseOff
     } elseif ($ClaudeOnly) {
         $script:TotalSteps = 1
         Invoke-Claude $loginUser
     } else {
         $script:TotalSteps = 7
         if ($NoClaude) { $script:TotalSteps = 6 }
+        if ($ReverseTunnel) { $script:TotalSteps++ }
         if (Invoke-Install) {
             Invoke-Service
             $port = Get-SshPort
             Invoke-Firewall $port
             Invoke-LoginSetup $keyUser
             Invoke-LoginCheck $loginUser
+            if ($ReverseTunnel) { Invoke-Reverse }
             if (-not $NoClaude) { Invoke-Claude $loginUser }
             Invoke-Check $loginUser $port
         } elseif (-not $NoClaude) {

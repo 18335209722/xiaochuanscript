@@ -40,6 +40,14 @@
     -Shell keep                         不改动远程登录后的命令行
     -Shell powershell                   强制设为 PowerShell（之前手动设成别的 shell 时用）
 
+  反向隧道相关的参数（双向连接：谁连进来就自动连回谁）：
+    -ReverseTunnel                      开启反向隧道（要和下面的 -ReverseUser、-ReverseKey 一起用）
+    -ReverseUser 对端账户名             反向连回去时，用对端机器上的哪个账户登录
+    -ReverseKey 私钥文件路径            反向连回去时用的免密私钥（本机上的 .ssh\id_ed25519 之类）
+    -ReverseMap 对端端口:主机:端口      反向隧道的端口映射（默认 2022:localhost:22）
+    -ReverseClientPort 端口             对端 SSH 服务端的端口（默认 22）
+    -ReverseOff                         关闭反向隧道功能
+
   Claude 命令行相关的参数：
     -NoClaude                           不安装 Claude 命令行
     -ClaudeOnly                         只安装 Claude 命令行，不动 SSH（不需要管理员权限，不弹 UAC）
@@ -84,6 +92,38 @@
   - 可以多次执行来加多个公钥；同一个公钥不会重复写入。
   - 公钥写在 用户目录\.ssh\authorized_keys；账户是管理员时还会写到
     C:\ProgramData\ssh\administrators_authorized_keys（管理员登录时 sshd 只认这个文件），并设好它要求的权限。
+
+反向隧道（双向连接，谁连进来就自动连回谁）：
+  需求是这样：别人（A 机器）SSH 连进这台 Windows（B）以后，B 要反过来自动连回 A，建立一条反向隧道。
+  这里做的是「反向端口转发」（ssh -R），不是把 A 的命令行交出去，相对安全。
+
+  开启（在 B 上执行一次）：
+      xiaochuan-remote.bat -ReverseTunnel -ReverseUser A上的账户 -ReverseKey B上的私钥文件
+  例如：
+      xiaochuan-remote.bat -ReverseTunnel -ReverseUser jie -ReverseKey C:\Users\chai\.ssh\id_ed25519
+
+  开启之后是怎么跑的：
+  - 每当有人 SSH 登录进 B，B 会读出「是谁连进来的」（SSH 来源 IP），
+    用你给的私钥自动反向连回那台机器：ssh -N -R 端口映射 -i 私钥 对端账户@来源IP。
+  - 隧道在有人登录进来时建立，连接断开后自动结束；同一个来源不会重复开。
+  - 端口映射默认 2022:localhost:22，意思是：在 A 上访问 localhost:2022，就等于访问 B 的 22 端口。
+    想映射别的端口（比如把 B 内网里某台机器的某个端口送到 A），用 -ReverseMap 改，格式是
+    对端端口:B这边能到的主机:端口，比如 -ReverseMap 13389:192.168.1.50:3389。
+
+  要满足的条件：
+  - 对端 A 要在跑 SSH 服务端（sshd），端口默认 22，不是 22 用 -ReverseClientPort 指定。
+  - B 上要有能免密登录 A 的私钥（就是 -ReverseKey 给的那个文件），对应的公钥已经放到 A 上了。
+    私钥文件权限要够严（只有本人能读），不然 Windows 的 ssh 会拒绝用它。
+  - 来源 IP 必须是 B 能直接连回去的地址：同一个局域网，或者两边都装了 Tailscale 用 100 开头的地址。
+    A 在 NAT 后面、B 连不回那个来源 IP 的话，隧道建不起来。
+  - B 要装了 OpenSSH 客户端（ssh.exe）。Win10/11 一般自带；没有的话到 设置 > 系统 > 可选功能 里装
+    「OpenSSH 客户端」。
+
+  实现方式（供排查）：
+  - 触发那段写在 PowerShell 全局配置里：C:\Windows\System32\WindowsPowerShell\v1.0\profile.ps1
+    （用 # >>> xiaochuan-remote reverse >>> 一对标记框住，只对 SSH 进来的会话生效，不影响本地开的窗口）。
+  - 实际反向连接的逻辑在 C:\ProgramData\ssh\xiaochuan-reverse.ps1，配置写死在里面，改配置重新执行开启命令即可。
+  - 关闭：xiaochuan-remote.bat -ReverseOff（删掉上面那段和工作脚本；已经在跑的隧道等断开后就没了）。
 
 Claude 命令行：
   用的是 Anthropic 官方安装脚本（https://claude.ai/install.ps1），装到 用户目录\.local\bin\claude.exe，
