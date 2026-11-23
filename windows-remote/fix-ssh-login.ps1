@@ -7,8 +7,9 @@
 #   3. 检查 sshd 配置（sshd_config）里有没有禁用密码登录、或 AllowUsers/DenyUsers 之类的限制。
 #   4. 按需要修复：给账户设密码（-SetPassword）、启用内置 Administrator（-EnableAdmin）、
 #      写入公钥免密登录（-PubKey）、强制打开密码登录（-AllowPassword）。
-#   5. 打印从别的电脑连接要用的 ssh 命令。
-# 直接双击 fix-ssh-login.bat 即可，Windows 会弹一次 UAC，点「是」。不加参数时只诊断 + 做安全的修复，不会动密码。
+#   5. 把远程登录后的命令行设为 PowerShell（用 Termius 等工具登录进来直接是 PowerShell；-Shell cmd 可以改回去）。
+#   6. 打印从别的电脑连接要用的 ssh 命令。
+# 直接双击 fix-ssh-login.bat 即可，Windows 会弹一次 UAC，点「是」。不加参数时只诊断 + 做安全的修复（含把命令行设为 PowerShell），不会动密码。
 # 兼容 Windows 自带的 PowerShell 5.1。本文件必须保存为「UTF-8 带 BOM」，否则中文会乱码。
 
 [CmdletBinding()]
@@ -18,6 +19,8 @@ param(
     [string]$PubKey = '',        # 写入公钥免密登录：公钥内容，或 .pub 文件路径
     [string]$ForUser = '',       # 公钥 / 设密码针对哪个账户；默认是当前登录的账户
     [switch]$AllowPassword,      # 强制在 sshd_config 里打开密码登录并重启 sshd
+    [ValidateSet('', 'powershell', 'cmd', 'keep')]
+    [string]$Shell = '',         # 远程登录后的命令行；不传 = 设为 PowerShell（已手动设成别的 shell 就保持不动）
     [switch]$Status,             # 只诊断，不做任何修改
     [switch]$DryRun,             # 演练：只显示将要做的事
     [switch]$Help,
@@ -28,7 +31,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Version = '1.0.0'
+$Version = '1.1.0'
 $SshData = Join-Path $env:ProgramData 'ssh'
 $SshdConfig = Join-Path $SshData 'sshd_config'
 $AdminKeys = Join-Path $SshData 'administrators_authorized_keys'
@@ -266,6 +269,40 @@ function Invoke-CheckConfig {
     if ($pwAuth -and -not $limits.Count) { Add-Ok 'sshd 配置没有挡住密码登录' }
 }
 
+# ================================================================ 第 4 步：远程登录后的命令行
+
+function Get-DefaultShell {
+    try { return "$((Get-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name 'DefaultShell' -ErrorAction Stop).DefaultShell)" } catch { return '' }
+}
+
+# 不传 -Shell 时设为 PowerShell；已经手动设成别的 shell（比如 pwsh、bash）就不覆盖。
+function Invoke-DefaultShell {
+    Write-Step '远程登录后的命令行（默认 PowerShell）'
+    $cur = Get-DefaultShell
+    $curText = if ($cur) { $cur } else { 'cmd（Windows 默认）' }
+    $want = $Shell
+    if (-not $want) {
+        if ($cur -and $cur -ne $PsExe) { $want = 'keep' } else { $want = 'powershell' }
+    }
+    if ($Status -or $want -eq 'keep') { Write-Log "现在是 $curText，不改动。"; return }
+    if ($want -eq 'powershell') {
+        if ($cur -eq $PsExe) { Write-Log '已经是 PowerShell，不用改。'; Add-Ok '远程登录后的命令行是 PowerShell（之前就设了）'; return }
+        if ($DryRun) { Write-Log '演练：将会把远程登录后的命令行设为 PowerShell。'; return }
+        try {
+            if (-not (Test-Path 'HKLM:\SOFTWARE\OpenSSH')) { New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force | Out-Null }
+            New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name 'DefaultShell' -Value $PsExe -PropertyType String -Force | Out-Null
+            Add-Ok '远程登录后的命令行已设为 PowerShell（已经连着的窗口要断开重新登录才生效）'
+        } catch { Write-Fail "默认命令行没有改成：$($_.Exception.Message)" }
+    } else {
+        if (-not $cur) { Write-Log '已经是 cmd，不用改。'; Add-Ok '远程登录后的命令行是 cmd（Windows 默认）'; return }
+        if ($DryRun) { Write-Log '演练：将会把远程登录后的命令行恢复为 cmd。'; return }
+        try {
+            Remove-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name 'DefaultShell' -ErrorAction Stop
+            Add-Ok '远程登录后的命令行已恢复为 cmd（Windows 默认）'
+        } catch { Write-Fail "默认命令行没有改成：$($_.Exception.Message)" }
+    }
+}
+
 # ================================================================ 修复动作
 
 function Invoke-SetPassword([string]$User) {
@@ -421,11 +458,13 @@ SSH 能连上但登录被拒（Connection closed / Permission denied）时，在
 查出原因并修好，最后打印能用的连接命令。
 
 用法：
-  双击 fix-ssh-login.bat                 诊断 + 安全修复（确保服务/防火墙，查出该用哪个账户）；不动密码
+  双击 fix-ssh-login.bat                 诊断 + 安全修复（确保服务/防火墙，查出该用哪个账户，
+                                         远程登录后的命令行设为 PowerShell）；不动密码
   fix-ssh-login.bat -Status              只诊断，不做任何修改
   fix-ssh-login.bat -SetPassword 账户名  给这个账户设登录密码（密码登录必须有密码）
   fix-ssh-login.bat -EnableAdmin         启用内置 Administrator 账户（默认被禁用）
   fix-ssh-login.bat -AllowPassword       强制在 sshd 配置里打开密码登录
+  fix-ssh-login.bat -Shell cmd           远程登录后的命令行恢复为 cmd（-Shell keep 是不改动）
   fix-ssh-login.bat -PubKey "ssh-ed25519 AAAA..." [-ForUser 账户名]
                                          写入公钥免密登录（也可给 .pub 文件路径）
   fix-ssh-login.bat -DryRun              演练：只显示将要做的事
@@ -453,8 +492,8 @@ $port = Get-SshPort
 
 if ($DryRun) { Write-Log '演练模式：只显示将要做的事，不做任何修改。' }
 
-# 算总步数：诊断固定 3 步（服务/账户/配置），加上要做的修复动作。
-$script:TotalSteps = 3
+# 算总步数：固定 4 步（服务/账户/配置/命令行），加上要做的修复动作。
+$script:TotalSteps = 4
 if (-not $Status) {
     if ($SetPassword) { $script:TotalSteps++ }
     if ($EnableAdmin) { $script:TotalSteps++ }
@@ -466,6 +505,7 @@ try {
     Invoke-EnsureServer $port
     Invoke-DiagnoseAccounts $loginUser
     Invoke-CheckConfig
+    Invoke-DefaultShell
     if (-not $Status) {
         if ($EnableAdmin) { Invoke-EnableAdmin }
         if ($SetPassword) { Invoke-SetPassword $SetPassword }

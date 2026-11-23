@@ -3,7 +3,7 @@
 #   1. 安装 Windows 自带的 OpenSSH 服务端（已经装了就跳过；系统自带的装不上时改从 GitHub 官方下载安装包）。
 #   2. 启动 sshd 服务，并设为开机自动启动。
 #   3. 防火墙放行 SSH 端口（默认 22）。
-#   4. 登录设置：可选写入公钥（免密码登录）、可选把远程登录后的命令行换成 PowerShell。
+#   4. 登录设置：把远程登录后的命令行设为 PowerShell（用 Termius 等工具登录进来直接是 PowerShell）、可选写入公钥（免密码登录）。
 #   5. 检查 SSH 端口确实通了，并显示从别的电脑连接要用的命令。
 # 直接双击 enable-ssh.bat 即可，Windows 会弹一次 UAC，点「是」。重复执行没有副作用。
 # 兼容 Windows 自带的 PowerShell 5.1。本文件必须保存为「UTF-8 带 BOM」，否则中文会乱码。
@@ -11,7 +11,8 @@
 [CmdletBinding()]
 param(
     [string]$PubKey = '',
-    [ValidateSet('', 'powershell', 'cmd')]
+    # 远程登录后的命令行。不传 = 设为 PowerShell（已经手动设成别的 shell 的话保持不动）。
+    [ValidateSet('', 'powershell', 'cmd', 'keep')]
     [string]$Shell = '',
     [switch]$Status,
     [switch]$Off,
@@ -24,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Version = '1.0.0'
+$Version = '1.1.0'
 $Capability = 'OpenSSH.Server~~~~0.0.1.0'
 $Repo = 'PowerShell/Win32-OpenSSH'
 $ReleasesPage = "https://github.com/$Repo/releases/latest"
@@ -100,6 +101,11 @@ function Test-Admin {
 }
 
 function Get-Sshd { return Get-Service -Name 'sshd' -ErrorAction SilentlyContinue }
+
+# 远程登录后用的命令行（注册表 HKLM\SOFTWARE\OpenSSH 的 DefaultShell）。没有设过返回空字符串，这时 sshd 用 cmd。
+function Get-DefaultShell {
+    try { return "$((Get-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name 'DefaultShell' -ErrorAction Stop).DefaultShell)" } catch { return '' }
+}
 
 # sshd 实际监听的端口：sshd_config 里没有写 Port 就是 22。
 function Get-SshPort {
@@ -326,26 +332,39 @@ function Add-KeysToFile([string]$File, [string[]]$Keys) {
 function Invoke-LoginSetup([string]$User, [bool]$UserIsAdmin) {
     Write-Step '登录设置（公钥、默认命令行）'
 
-    # ---- 默认命令行
-    if ($Shell -eq 'powershell') {
-        if ($DryRun) { Write-Log '演练：将会把远程登录后的命令行设为 PowerShell。' }
+    # ---- 默认命令行：不传 -Shell 时设为 PowerShell；已经手动设成别的 shell（比如 pwsh、bash）就不覆盖。
+    $cur = Get-DefaultShell
+    $want = $Shell
+    if (-not $want) {
+        if ($cur -and $cur -ne $PsExe) { $want = 'keep' } else { $want = 'powershell' }
+    }
+    if ($want -eq 'powershell') {
+        if ($cur -eq $PsExe) {
+            Write-Log '远程登录后的命令行已经是 PowerShell，不用改。'
+            Add-Ok '远程登录后的命令行是 PowerShell（之前就设了）'
+        } elseif ($DryRun) { Write-Log '演练：将会把远程登录后的命令行设为 PowerShell。' }
         else {
             try {
-                if (-not (Test-Path 'HKLM:\SOFTWARE\OpenSSH')) { New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' | Out-Null }
+                if (-not (Test-Path 'HKLM:\SOFTWARE\OpenSSH')) { New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force | Out-Null }
                 New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name 'DefaultShell' -Value $PsExe -PropertyType String -Force | Out-Null
-                Add-Ok '远程登录后的命令行已设为 PowerShell'
+                Add-Ok '远程登录后的命令行已设为 PowerShell（已经连着的窗口要断开重新登录才生效）'
             } catch { Write-Fail "默认命令行没有改成：$($_.Exception.Message)" }
         }
-    } elseif ($Shell -eq 'cmd') {
-        if ($DryRun) { Write-Log '演练：将会把远程登录后的命令行恢复为 cmd。' }
+    } elseif ($want -eq 'cmd') {
+        if (-not $cur) {
+            Write-Log '远程登录后的命令行已经是 cmd，不用改。'
+            Add-Ok '远程登录后的命令行是 cmd（Windows 默认）'
+        } elseif ($DryRun) { Write-Log '演练：将会把远程登录后的命令行恢复为 cmd。' }
         else {
             try {
-                Remove-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name 'DefaultShell' -ErrorAction SilentlyContinue
+                Remove-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name 'DefaultShell' -ErrorAction Stop
                 Add-Ok '远程登录后的命令行已恢复为 cmd（Windows 默认）'
             } catch { Write-Fail "默认命令行没有改成：$($_.Exception.Message)" }
         }
+    } elseif ($cur) {
+        Write-Log "远程登录后的命令行：保持现在的 $cur，不改动（想换成 PowerShell 可以加参数 -Shell powershell）。"
     } else {
-        Write-Log '默认命令行：不改动（想换成 PowerShell 可以加参数 -Shell powershell）。'
+        Write-Log '远程登录后的命令行：保持 cmd，不改动。'
     }
 
     # ---- 公钥
@@ -457,8 +476,7 @@ function Show-Status {
     else { Write-Host "  - 防火墙：没有本脚本建的规则 $RuleName（系统自带的规则可能只放行专用网络）" }
     if (Test-SshPort $port) { Write-Host "  √ SSH 端口 $port：有应答" -ForegroundColor Green }
     else { Write-Host "  × SSH 端口 $port：没有应答" -ForegroundColor Red; $bad++ }
-    $sh = ''
-    try { $sh = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name 'DefaultShell' -ErrorAction Stop).DefaultShell } catch { }
+    $sh = Get-DefaultShell
     if ($sh) { Write-Host "  - 远程登录后的命令行：$sh" } else { Write-Host '  - 远程登录后的命令行：cmd（Windows 默认）' }
     if ($bad -eq 0) { Show-Connect $env:USERNAME $port }
     return $bad
@@ -501,11 +519,12 @@ if ($Help) {
 安装 OpenSSH 服务端、启动并设为开机自启、防火墙放行端口，最后显示连接命令。
 
 用法：
-  双击 enable-ssh.bat                   打开 SSH，用 Windows 账户的密码登录
+  双击 enable-ssh.bat                   打开 SSH，用 Windows 账户的密码登录；远程登录后的命令行设为 PowerShell
   enable-ssh.bat -PubKey "ssh-ed25519 AAAA... 备注"
                                         同时写入公钥，可以免密码登录（也可以给 .pub 文件的路径）
-  enable-ssh.bat -Shell powershell      远程登录后的命令行用 PowerShell（默认不改动，是 cmd）
-  enable-ssh.bat -Shell cmd             远程登录后的命令行恢复为 cmd
+  enable-ssh.bat -Shell cmd             远程登录后的命令行恢复为 cmd（Windows 默认）
+  enable-ssh.bat -Shell keep            不改动远程登录后的命令行
+  enable-ssh.bat -Shell powershell      强制设为 PowerShell（之前手动设成别的 shell 时用）
   enable-ssh.bat -Status                只查看现在的状态和连接命令，不做任何修改
   enable-ssh.bat -Off                   关闭：停止 sshd 服务并删除防火墙规则
   enable-ssh.bat -DryRun                演练：只显示将要做的事，不做任何修改
