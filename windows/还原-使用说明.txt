@@ -1,0 +1,34 @@
+小川环境还原助手 · Windows 版 1.0.0 · 使用说明
+
+作用：把 xiaochuan-env（小川环境助手）改过的设置还原成「中国 / 中文」。
+文件：xiaochuan-restore.bat + xiaochuan-restore.ps1（两个文件要放在同一个目录）。
+
+运行：
+  双击 xiaochuan-restore.bat                 交互菜单（输入 a 一键还原）
+  xiaochuan-restore.bat -All                 直接执行：Chrome + 时区 + 语言 + 开定位 + 开 IPv6
+  xiaochuan-restore.bat -All -DryRun         演练，只显示将要做的事
+  xiaochuan-restore.bat status               检查当前状态（√ 已还原，× 还没还原）
+  xiaochuan-restore.bat -Help                全部参数
+
+  脚本会自己弹出 UAC 申请管理员权限，不需要手动「以管理员身份运行」。
+
+还原的内容：
+  1. Chrome（-Chrome）：界面语言和语言列表改回中文（zh-CN、zh），翻译目标改回中文；
+     定位从「不允许」改回 Chrome 默认的「网站可以询问」。
+  2. 时区（-Timezone）：改回中国标准时间（Asia/Shanghai，北京时间）。
+  3. 语言（-Language）：语言列表、显示语言、区域格式、国家或地区、系统区域设置都改回简体中文 / 中国，
+     输入法加回微软拼音。修改前的语言列表是中文打头的话（比如「中文 + 英文」）会照原样恢复。
+  4. 定位（-Location）：打开「定位服务」「允许应用访问你的位置」「允许桌面应用访问你的位置」。
+  5. IPv6（-IPv6）：各网卡重新勾上 IPv6（马上生效），删除系统级开关 DisabledComponents（重启后生效）。
+
+注意：
+  - 语言和输入法要注销或重启 Windows 后才完全生效；IPv6 的系统级开关要重启后生效。
+  - 清理掉的 Claude Code 缓存、会话历史、Chrome 缓存无法还原，也不需要还原。
+  - 「自动设置时区」不会重新打开（时区固定为北京时间）；需要的话到 设置 > 时间和语言 > 日期和时间 手动打开。
+  - Chrome 在运行时会先自动把它关闭（标签页下次可恢复）。执行前请先保存好网页里没提交的内容。
+  - 系统里没有中文显示语言包时（原来就是英文系统），界面文字仍是英文，「执行结果」里会标红提示：
+    到 设置 > 时间和语言 > 语言和区域 添加「中文(简体，中国)」。
+  - 英文语言包不会被卸载。Claude Code / Claude Desktop 不会被卸载。
+
+备份位置（本脚本修改前的 Chrome 配置）：
+  %USERPROFILE%\.xiaochuan-env\restore-backups\<时间>\chrome-files\

@@ -1,0 +1,40 @@
+小川环境还原助手 · macOS / Linux 版 1.0.0 · 使用说明
+
+作用：把 xiaochuan-env.sh（小川环境助手）改过的设置还原成「中国 / 中文」。
+macOS 和 Linux 是同一个脚本，会自动识别系统。
+
+运行：
+  macOS：在访达里双击 xiaochuan-restore.command 即可打开菜单。
+         提示没有权限时，在终端执行一次：chmod +x xiaochuan-restore.command
+  终端：
+    bash xiaochuan-restore.sh                    交互菜单（输入 a 一键还原）
+    bash xiaochuan-restore.sh --all              直接执行：Chrome + 时区 + 语言 + 开定位 + 开 IPv6
+    bash xiaochuan-restore.sh --all --dry-run    演练，只显示将要做的事
+    bash xiaochuan-restore.sh status             检查当前状态（✓ 已还原，✗ 还没还原）
+    bash xiaochuan-restore.sh --help             全部参数
+
+  不要在前面加 sudo。脚本会在需要时自己申请管理员权限，只要输一次本机登录密码。
+
+还原的内容：
+  1. Chrome（--chrome）：界面语言和语言列表改回中文（zh-CN、zh），翻译目标改回中文；
+     定位从「不允许」改回 Chrome 默认的「网站可以询问」。
+  2. 时区（--timezone）：改回 Asia/Shanghai（北京时间）。
+  3. 语言（--language）：系统语言 / 区域改回简体中文（中国），并加回中文输入法：
+     - 优先恢复 xiaochuan-env 最早一次备份（~/.xiaochuan-env/backups/）里的输入法列表；
+     - 没有备份时，macOS 加回「ABC + 简体拼音」；Linux 的 fcitx5 加回 pinyin，
+       GNOME（ibus）装了 libpinyin 的话加回它，否则提示手动添加。
+  4. 定位（--location）：macOS 打开「定位服务」总开关；Linux 取消屏蔽 GeoClue 并打开 GNOME 的「定位服务」。
+  5. IPv6（--ipv6）：macOS 把每个网络服务的 IPv6 改回「自动」；
+     Linux 删除 /etc/sysctl.d/99-xiaochuan-disable-ipv6.conf 并用 sysctl 马上打开。
+
+注意：
+  - 语言和输入法要注销或重启后才完全生效。
+  - 清理掉的 Claude Code 缓存、会话历史、Chrome 缓存无法还原，也不需要还原。
+  - 「自动设置时区」不会重新打开（时区固定为北京时间）；需要的话到系统设置里手动打开。
+  - Chrome 在运行时会先自动把它关闭（标签页下次可恢复）。执行前请先保存好网页里没提交的内容。
+  - 新版 macOS 可能不让脚本改「定位服务」开关：这时「执行结果」里会标红，请按提示手动打开。
+  - Ubuntu / Debian 没装中文语言包时界面仍是英文，脚本会提示安装命令：
+    sudo apt install language-pack-zh-hans language-pack-gnome-zh-hans
+
+备份位置（本脚本修改前的 Chrome 配置和输入法配置）：
+  ~/.xiaochuan-env/restore-backups/<时间>/
