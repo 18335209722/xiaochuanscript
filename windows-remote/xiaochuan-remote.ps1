@@ -7,7 +7,9 @@
 #      可选写入公钥（-PubKey）、给账户设密码（-SetPassword）、启用 Administrator（-EnableAdmin）、打开密码登录（-AllowPassword）。
 #   5. 登录检查：列出本机账户，指出该用哪个账户登录；检查 sshd 配置有没有挡住登录。
 #   6. 安装 Claude Code 命令行（claude），并加进 PATH，命令窗口里直接输入 claude 就能用。
-#   7. 检查 SSH 端口确实通了，并显示从别的电脑连接要用的命令。
+#   7. 这台电脑没有装 Claude Desktop（桌面版）的话，安装它。
+#   8. 这台电脑没有装 Chrome 浏览器的话，安装它。
+#   9. 检查 SSH 端口确实通了，并显示从别的电脑连接要用的命令。
 # 直接双击 xiaochuan-remote.bat 即可，Windows 会弹一次 UAC，点「是」。重复执行没有副作用。
 # 兼容 Windows 自带的 PowerShell 5.1。本文件必须保存为「UTF-8 带 BOM」，否则中文会乱码。
 
@@ -30,6 +32,8 @@ param(
     [switch]$NoClaude,           # 不安装 Claude 命令行
     [switch]$ClaudeOnly,         # 只安装 Claude 命令行，不动 SSH（不需要管理员权限）
     [switch]$UpdateClaude,       # Claude 命令行已经装了的话，升级到最新版
+    [switch]$NoDesktop,          # 不安装 Claude Desktop（桌面版）
+    [switch]$NoChrome,           # 不安装 Chrome 浏览器
     [switch]$Status,             # 只查看现在的状态，不做任何修改
     [switch]$Off,                # 关闭 SSH：停止 sshd 服务并删除防火墙规则
     [switch]$DryRun,             # 演练：只显示将要做的事
@@ -41,7 +45,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Version = '1.0.0'
+$Version = '1.1.0'
 $Capability = 'OpenSSH.Server~~~~0.0.1.0'
 $Repo = 'PowerShell/Win32-OpenSSH'
 $ReleasesPage = "https://github.com/$Repo/releases/latest"
@@ -59,6 +63,13 @@ $ClaudeInstallUrl = 'https://claude.ai/install.ps1'
 $ClaudeNpmPackage = '@anthropic-ai/claude-code'
 $ClaudeBinDir = Join-Path $env:USERPROFILE '.local\bin'
 $ClaudeExe = Join-Path $ClaudeBinDir 'claude.exe'
+# Claude Desktop 和 Chrome 的官方安装包（下载后要核对数字签名才会安装）
+# Claude Desktop：这个目录下的 .latest 写着最新版本号，安装包是 <版本号>/Claude-<hash>.msix
+$ClaudeDesktopBase = 'https://downloads.claude.ai/releases/win32/x64'
+$ClaudeDesktopPage = 'https://claude.ai/download'
+$ChromeMsiUrl = 'https://dl.google.com/chrome/install/googlechromestandaloneenterprise64.msi'
+# 安装程序 / winget 超过这个秒数还没结束，就不再等。
+$InstallTimeout = 600
 # 反向隧道：登录进来时跑的工作脚本、PowerShell 全局配置、本机的 SSH 客户端
 $ReverseWorker = Join-Path $SshData 'xiaochuan-reverse.ps1'
 $SshClientExe = Join-Path $env:WINDIR 'System32\OpenSSH\ssh.exe'
@@ -761,6 +772,207 @@ function Invoke-Claude([string]$User) {
     Show-ClaudeUsage
 }
 
+# ================================================================ Claude Desktop / Chrome（没有装才安装）
+
+# 运行一个安装程序并限时等待。返回退出码；超时（会把它结束掉）或启动不了返回 $null。
+function Start-Timed([string]$File, [string[]]$ArgList, [int]$TimeoutSec) {
+    try {
+        $p = Start-Process -FilePath $File -ArgumentList $ArgList -PassThru
+        $null = $p.Handle      # 不先取一次句柄的话，进程结束后读不到退出码
+        if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+            try { $p.Kill() } catch { }
+            Write-Note "等了 $TimeoutSec 秒还没结束，不再等待：$File"
+            return $null
+        }
+        return [int]$p.ExitCode
+    } catch {
+        Write-Note "启动不了 $File：$($_.Exception.Message)"
+        return $null
+    }
+}
+
+# 下载官方安装包，并核对数字签名：签名有效、而且签名的公司对得上才算数。
+function Get-Installer([string]$Url, [string]$OutFile, [string]$Signer) {
+    Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+    Write-Log "正在下载：$Url"
+    $ok = $false
+    # 系统自带 curl.exe 的话用它：有进度显示，也比 PowerShell 自己下载快很多。
+    $curl = Join-Path $env:WINDIR 'System32\curl.exe'
+    if (Test-Path -LiteralPath $curl -PathType Leaf) {
+        try {
+            & $curl -L --fail --retry 2 --connect-timeout 20 -o $OutFile $Url
+            $ok = ($LASTEXITCODE -eq 0)
+        } catch { }
+    }
+    if (-not $ok) {
+        $oldPref = $ProgressPreference
+        $ProgressPreference = 'SilentlyContinue'
+        try { Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing; $ok = $true }
+        catch { Write-Note "没有下载下来：$($_.Exception.Message)" }
+        finally { $ProgressPreference = $oldPref }
+    }
+    if (-not $ok -or -not (Test-Path -LiteralPath $OutFile -PathType Leaf)) { return $false }
+    # $Signer 为空：不在这里核对（msix 包由 Windows 在安装时自己核对签名）。
+    if (-not $Signer) { return $true }
+    $sig = $null
+    try { $sig = Get-AuthenticodeSignature -LiteralPath $OutFile } catch { }
+    if (-not $sig -or "$($sig.Status)" -ne 'Valid' -or "$($sig.SignerCertificate.Subject)" -notmatch $Signer) {
+        Write-Note "下载下来的安装包没有 $Signer 的有效数字签名（可能下载不完整或被替换），不安装。"
+        Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    return $true
+}
+
+# 备用办法：用 winget 安装。winget 在有些电脑上会一直卡住，所以限时。
+function Install-WithWinget([string]$Id) {
+    $wg = Get-Command 'winget.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $wg) { Write-Log '这台电脑没有 winget，不能用 winget 这个备用办法。'; return $false }
+    Write-Log "改用 winget 安装 $Id（最多等 $([int]($InstallTimeout / 60)) 分钟）…"
+    $code = Start-Timed $wg.Source @('install', '--id', $Id, '-e', '--silent', '--accept-source-agreements', '--accept-package-agreements') $InstallTimeout
+    if ($null -eq $code) { return $false }
+    if ($code -ne 0) { Write-Note "winget 返回了错误码 $code。"; return $false }
+    return $true
+}
+
+# 找 Claude Desktop：旧版装在 用户目录\AppData\Local\AnthropicClaude，新版是应用商店格式的包。没有返回空字符串。
+function Find-ClaudeDesktop {
+    $exe = Join-Path $env:LOCALAPPDATA 'AnthropicClaude\claude.exe'
+    if (Test-Path -LiteralPath $exe -PathType Leaf) { return $exe }
+    try {
+        $pkg = Get-AppxPackage -ErrorAction Stop | Where-Object { $_.Name -like '*Claude*' -and $_.Publisher -like '*Anthropic*' } | Select-Object -First 1
+        if ($pkg) { return "$($pkg.Name) $($pkg.Version)" }
+    } catch { }
+    foreach ($root in 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall') {
+        $hit = Get-ItemProperty -Path "$root\*" -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSObject.Properties['DisplayName'] -and $_.DisplayName -eq 'Claude' } | Select-Object -First 1
+        if ($hit) { return "Claude $($hit.DisplayVersion)" }
+    }
+    return ''
+}
+
+# 查出 Claude Desktop 最新安装包的下载地址；查不到返回空字符串。
+function Get-ClaudeDesktopUrl {
+    $oldPref = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try {
+        $r = Invoke-WebRequest -Uri "$ClaudeDesktopBase/.latest" -UseBasicParsing -TimeoutSec 30
+        $text = $r.Content
+        if ($text -is [byte[]]) { $text = [Text.Encoding]::UTF8.GetString($text) }
+        $j = "$text" | ConvertFrom-Json
+        # 版本号和 hash 要拼进下载地址，格式不对就不用。
+        if ("$($j.version)" -match '^\d+(\.\d+)+$' -and "$($j.hash)" -match '^[0-9a-f]{40}$') {
+            return "$ClaudeDesktopBase/$($j.version)/Claude-$($j.hash).msix"
+        }
+        Write-Note '官方的版本信息格式和预期的不一样，查不出安装包地址。'
+    } catch {
+        Write-Note "没有查到 Claude Desktop 的最新版本：$($_.Exception.Message)"
+    } finally { $ProgressPreference = $oldPref }
+    return ''
+}
+
+# $User 是要远程登录的那个 Windows 用户。Claude Desktop 也是装在用户自己目录里的，只能给「现在运行脚本的这个用户」装。
+function Invoke-Desktop([string]$User) {
+    Write-Step '安装 Claude Desktop（桌面版；已经装了就跳过）'
+    if ($User -ne $env:USERNAME) {
+        Write-Note "UAC 用的是另一个管理员账户（$($env:USERNAME)），不能替 $User 安装 Claude Desktop。"
+        Write-Host "    请用 $User 自己到 $ClaudeDesktopPage 下载安装。"
+        Add-Info "Claude Desktop 没有安装：请用 $User 自己到 $ClaudeDesktopPage 下载安装"
+        return
+    }
+    $found = Find-ClaudeDesktop
+    if ($found) {
+        Write-Log "已经装了：$found，跳过安装。"
+        Add-Ok "Claude Desktop：已经装了（$found）"
+        return
+    }
+    if ($DryRun) {
+        Write-Log "演练：这台电脑没有 Claude Desktop，将会从 $ClaudeDesktopBase 下载官方安装包安装（下载不了时改用 winget）。"
+        return
+    }
+    Write-Log '这台电脑没有 Claude Desktop，开始安装（安装包 200 多 MB，网速慢时要等几分钟，请不要关窗口）…'
+    $tmp = Join-Path $env:TEMP ("Claude-Setup-{0}.msix" -f $PID)
+    try {
+        $url = Get-ClaudeDesktopUrl
+        if ($url -and (Get-Installer $url $tmp '')) {
+            Write-Log '正在安装 Claude Desktop…'
+            # msix 包：Windows 安装时会自己核对数字签名，签名不对装不上。
+            try { Add-AppxPackage -Path $tmp -ErrorAction Stop }
+            catch { Write-Note "安装没有成功：$($_.Exception.Message)" }
+        }
+    } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    if (-not (Find-ClaudeDesktop)) { Install-WithWinget 'Anthropic.Claude' | Out-Null }
+
+    $found = Find-ClaudeDesktop
+    if ($found) {
+        Add-Ok "Claude Desktop 已安装（$found），在开始菜单里找「Claude」打开"
+    } else {
+        Write-Fail 'Claude Desktop 没有装上。'
+        Write-Host '    最常见的原因是网络：这台电脑要能访问 downloads.claude.ai。'
+        Write-Host "    网络调好之后再执行一次 xiaochuan-remote.bat；也可以到 $ClaudeDesktopPage 手动下载安装。"
+    }
+}
+
+# 找 Chrome 浏览器的 chrome.exe；没有返回空字符串。
+function Find-Chrome {
+    foreach ($hive in 'HKLM:', 'HKCU:') {
+        try {
+            $key = Get-Item -LiteralPath "$hive\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe" -ErrorAction Stop
+            $v = "$($key.GetValue(''))"
+            if ($v -and (Test-Path -LiteralPath $v -PathType Leaf)) { return $v }
+        } catch { }
+    }
+    foreach ($base in $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA) {
+        if (-not $base) { continue }
+        $p = Join-Path $base 'Google\Chrome\Application\chrome.exe'
+        if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
+    }
+    return ''
+}
+
+# Chrome 用的是 Google 官方的离线安装包（msi），装给这台电脑的所有用户。
+function Invoke-Chrome {
+    Write-Step '安装 Chrome 浏览器（已经装了就跳过）'
+    $found = Find-Chrome
+    if ($found) {
+        Write-Log "已经装了：$found，跳过安装。"
+        Add-Ok 'Chrome 浏览器：已经装了'
+        return
+    }
+    if ($DryRun) {
+        Write-Log "演练：这台电脑没有 Chrome，将会下载 Google 官方安装包安装（下载不了时改用 winget）：$ChromeMsiUrl"
+        return
+    }
+    Write-Log '这台电脑没有 Chrome，开始安装（安装包 100 多 MB，网速慢时要等几分钟，请不要关窗口）…'
+    $tmp = Join-Path $env:TEMP ("chrome-setup-{0}.msi" -f $PID)
+    try {
+        if (Get-Installer $ChromeMsiUrl $tmp 'Google LLC') {
+            Write-Log '正在安装 Chrome…'
+            $code = Start-Timed (Join-Path $env:WINDIR 'System32\msiexec.exe') @('/i', "`"$tmp`"", '/qn', '/norestart') $InstallTimeout
+            # 3010 = 装好了，但要重启后才完全生效。
+            if ($null -ne $code -and $code -ne 0 -and $code -ne 3010) { Write-Note "安装程序返回了错误码 $code。" }
+        }
+    } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    if (-not (Find-Chrome)) { Install-WithWinget 'Google.Chrome' | Out-Null }
+
+    $found = Find-Chrome
+    if ($found) {
+        Add-Ok "Chrome 浏览器已安装：$found"
+    } else {
+        Write-Fail 'Chrome 浏览器没有装上。'
+        Write-Host '    最常见的原因是网络：这台电脑要能访问 dl.google.com。'
+        Write-Host '    网络调好之后再执行一次 xiaochuan-remote.bat；也可以到 https://www.google.com/chrome/ 手动下载安装。'
+    }
+}
+
+# 第 6 步之后的几个安装：Claude 命令行、Claude Desktop、Chrome。各自可以用 -NoXxx 跳过。
+function Invoke-Apps([string]$User) {
+    if (-not $NoClaude) { Invoke-Claude $User }
+    if (-not $NoDesktop) { Invoke-Desktop $User }
+    if (-not $NoChrome) { Invoke-Chrome }
+}
+
 # ================================================================ 反向隧道：登录进来后自动连回来源机器
 
 # 生成「登录进来时跑的工作脚本」。配置（账户 / 私钥 / 端口映射 / 对端端口）直接写死在里面，
@@ -967,6 +1179,12 @@ function Show-Status {
         if ($claude -ne $ClaudeExe -or (Test-ClaudeInPath)) { Write-Host '  √ PATH：命令窗口里可以直接输入 claude' -ForegroundColor Green }
         else { Write-Host "  × PATH：$ClaudeBinDir 不在 PATH 里，命令窗口里不能直接输入 claude" -ForegroundColor Red; $bad++ }
     }
+    $desktop = Find-ClaudeDesktop
+    if ($desktop) { Write-Host "  √ Claude Desktop：$desktop" -ForegroundColor Green }
+    else { Write-Host '  × Claude Desktop：没有安装' -ForegroundColor Red; $bad++ }
+    $chrome = Find-Chrome
+    if ($chrome) { Write-Host "  √ Chrome 浏览器：$chrome" -ForegroundColor Green }
+    else { Write-Host '  × Chrome 浏览器：没有安装' -ForegroundColor Red; $bad++ }
     if ($svc) {
         Write-Host ''
         Show-Accounts $env:USERNAME
@@ -1011,7 +1229,7 @@ if ($Help) {
 
 一个脚本把「远程用命令行操作这台电脑」要做的事全做完：打开 SSH（安装 OpenSSH 服务端、开机自启、
 防火墙放行）、远程登录后的命令行设为 PowerShell、检查登录会不会被拒、安装 Claude 命令行，
-最后显示连接命令。
+没有装 Claude Desktop / Chrome 浏览器的话把它们装上，最后显示连接命令。
 
 用法：
   双击 xiaochuan-remote.bat             全部做完；用 Windows 账户的密码登录
@@ -1038,6 +1256,10 @@ Claude 命令行相关：
   -NoClaude                             不安装 Claude 命令行
   -ClaudeOnly                           只安装 Claude 命令行，不动 SSH（不需要管理员权限）
   -UpdateClaude                         已经装了的话，升级到最新版
+
+Claude Desktop / Chrome（这台电脑没有装才会安装，已经装了就跳过）：
+  -NoDesktop                            不安装 Claude Desktop（桌面版）
+  -NoChrome                             不安装 Chrome 浏览器
 "@
     Exit-Script 0
 }
@@ -1085,8 +1307,10 @@ try {
         $script:TotalSteps = 1
         Invoke-Claude $loginUser
     } else {
-        $script:TotalSteps = 7
-        if ($NoClaude) { $script:TotalSteps = 6 }
+        # Claude 命令行、Claude Desktop、Chrome 这三步各自可以跳过。
+        $appSteps = 0
+        foreach ($skipped in $NoClaude, $NoDesktop, $NoChrome) { if (-not $skipped) { $appSteps++ } }
+        $script:TotalSteps = 6 + $appSteps
         if ($ReverseTunnel) { $script:TotalSteps++ }
         if (Invoke-Install) {
             Invoke-Service
@@ -1095,12 +1319,12 @@ try {
             Invoke-LoginSetup $keyUser
             Invoke-LoginCheck $loginUser
             if ($ReverseTunnel) { Invoke-Reverse }
-            if (-not $NoClaude) { Invoke-Claude $loginUser }
+            Invoke-Apps $loginUser
             Invoke-Check $loginUser $port
-        } elseif (-not $NoClaude) {
-            # SSH 没装上也不耽误装 Claude。
-            $script:TotalSteps = 2
-            Invoke-Claude $loginUser
+        } else {
+            # SSH 没装上也不耽误装 Claude 和 Chrome。
+            $script:TotalSteps = 1 + $appSteps
+            Invoke-Apps $loginUser
         }
     }
 } catch {

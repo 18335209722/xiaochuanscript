@@ -1,4 +1,4 @@
-小川远程助手 · Windows 版 1.0.0 · 使用说明
+小川远程助手 · Windows 版 1.1.0 · 使用说明
 
 只有一个脚本：xiaochuan-remote.bat + xiaochuan-remote.ps1（两个文件要放在同一个目录）。
 和 windows 目录里的 xiaochuan-env.bat、after-reboot.bat 互不影响。
@@ -8,7 +8,7 @@
   （Termius、或者 Windows / macOS / Linux 的 ssh 命令）登录这台电脑，登录进来是 PowerShell，
   并且可以直接输入 claude 使用 Claude 命令行。
 
-  一次做七件事：
+  一次做九件事：
     1. 安装 OpenSSH 服务端（Windows 自带的可选功能）。已经装了就跳过。
        系统自带的装不上时（比如 Windows 更新被禁用），自动改从 GitHub 官方
        （https://github.com/PowerShell/Win32-OpenSSH）下载安装包安装。
@@ -19,7 +19,11 @@
     5. 登录检查：列出本机账户，指出该用哪个账户登录、哪些账户登录会被拒；
        检查 sshd 配置有没有挡住登录。这一步只看不改。
     6. 安装 Claude 命令行（Claude Code），并加进 PATH，命令窗口里直接输入 claude 就能用。
-    7. 检查 SSH 端口确实通了，并显示从别的电脑连接要用的命令。
+    7. 这台电脑没有装 Claude Desktop（桌面版）的话，安装它；已经装了就跳过。
+       从官方 downloads.claude.ai 下载最新的安装包（msix，200 多 MB），下载不了时改用 winget。
+    8. 这台电脑没有装 Chrome 浏览器的话，安装它；已经装了就跳过。
+       用的是 Google 官方的离线安装包（dl.google.com，核对 Google 的数字签名后才安装），下载不了时改用 winget。
+    9. 检查 SSH 端口确实通了，并显示从别的电脑连接要用的命令。
 
   重复执行没有副作用：已经做好的步骤会直接跳过或保持原样。
 
@@ -52,6 +56,10 @@
     -NoClaude                           不安装 Claude 命令行
     -ClaudeOnly                         只安装 Claude 命令行，不动 SSH（不需要管理员权限，不弹 UAC）
     -UpdateClaude                       已经装了的话，升级到最新版
+
+  Claude Desktop / Chrome 相关的参数（没有装才会安装，已经装了就跳过）：
+    -NoDesktop                          不安装 Claude Desktop（桌面版）
+    -NoChrome                           不安装 Chrome 浏览器
 
   不需要手动「以管理员身份运行」。执行时 Windows 会弹一次 UAC，点「是」，之后在新开的窗口里执行。
 
