@@ -1,0 +1,65 @@
+小川强制代理助手 · macOS / Linux 版 1.0.0 · 使用说明
+
+作用：按《Windows Claude 强制代理实施方案》的思路，让 Claude Code（macOS 上还有 Claude Desktop）只走 Clash 本地代理；
+      代理失效时连接失败，不会自动直连。其他软件保持原有网络方式。
+文件：xiaochuan-proxy.sh（macOS 可以双击 xiaochuan-proxy.command）。
+前提：Clash 已经打开、订阅已导入、节点可用。
+
+运行：
+  bash xiaochuan-proxy.sh                    交互菜单（输入 a 一键执行）
+  bash xiaochuan-proxy.sh --all              直接执行：Claude Code 代理设置（macOS 再加 Proxifier）
+  bash xiaochuan-proxy.sh --all --dry-run    演练，只显示将要做的事
+  bash xiaochuan-proxy.sh status             检查当前状态（✓ 到位，✗ 没到位）
+  bash xiaochuan-proxy.sh undo               撤销本脚本做的全部修改
+  bash xiaochuan-proxy.sh --help             全部参数
+
+  不要在前面加 sudo：脚本会在需要时自己申请管理员权限。
+
+脚本做的事：
+  0. 找 Clash 本地代理入口：从 Clash Verge / ClashX / mihomo 的配置文件和正在监听的端口里自动找出
+     Mixed / SOCKS / HTTP 端口，并真的通过它连一次 Claude 的服务器。不通就停下，不往后做。
+     端口找不到时用 --proxy-port 指定。
+     电脑上没有任何 Clash 客户端时，会按 CPU 下载并安装 Clash Verge Rev：
+       macOS：Apple 芯片下 aarch64 的 dmg，Intel 芯片下 x64 的 dmg（在 Rosetta 下运行也能认出 Apple 芯片）；
+       Linux：按 deb / rpm 和 amd64 / arm64 选安装包。
+  1. Claude Code 代理设置（--claude-code，macOS 和 Linux）：在 ~/.claude/settings.json 的 env 里写入
+     HTTPS_PROXY / HTTP_PROXY = http://127.0.0.1:端口。Claude Code 自己只走这个代理，代理不通就失败。
+  2. Proxifier（--proxifier，仅 macOS）：从官网下载 dmg（同一个安装包同时支持 Apple 芯片和 Intel 芯片）、
+     装到 /Applications、校验代码签名；备份现有配置；写入配置 xiaochuan-claude.ppx 并载入：
+     代理服务器 = Clash 本地入口；规则「Claude via Clash」= Claude Desktop（Claude、Claude Helper）和 Claude Code；
+     Localhost 规则和 Default 规则保持 Direct。规则没有「代理失败后直连」的回退。Claude 的域名通过代理解析。
+  3. 浏览器（--browser，仅 Linux，可选）：给 Chrome / Edge / Chromium 写策略文件
+     （/etc/opt/chrome/policies/managed/xiaochuan-proxy.json 等），Claude 的网站只走 Clash，没有直连回退。
+     --browser-mode all 时所有网站都走 Clash。
+  4. IPv6：只检查、不关闭。确实要关时用 xiaochuan-env.sh 的「关闭系统 IPv6」。
+
+脚本做不了的事：
+  - Clash 的订阅：导入订阅、选节点要你自己来（订阅链接只有你有）。
+  - macOS 上允许 Proxifier 的网络扩展：第一次打开 Proxifier 时，要到
+    系统设置 > 通用 > 登录项与扩展 > 网络扩展 里手动允许（系统不允许脚本代点）。
+  - Proxifier 是收费软件：31 天试用，到期后要自己购买并输入注册码。
+    要开机自动启动的话，把它加到 系统设置 > 通用 > 登录项。
+  - 防火墙 Kill Switch：macOS 和 Linux 自带的防火墙都不能「按程序」拦出站连接，所以没有 Windows 版那样的 Kill Switch。
+    结果是：macOS 上 Proxifier 退出时 Claude Desktop 会直连。Claude Code 有自己的代理设置（第 1 步），不受影响。
+  - Linux 上没有 Proxifier，也没有官方的 Claude Desktop，所以 Linux 只有第 1 步（和可选的第 3 步）。
+  - macOS 上浏览器的强制代理策略要靠 MDM（设备管理）下发，脚本做不了。
+  - macOS 版 Proxifier 按「可执行文件名」认程序。Claude Code 原生版的文件名是版本号（如 2.1.331），
+    脚本把当前已有的版本都写进了规则；Claude Code 自动更新后文件名会变，重新执行一次 --all 即可
+    （没重新执行也不会直连，第 1 步的代理设置一直有效）。
+  - Claude Code 调用的其他程序（git、npm、curl 等）不在规则里，它们保持原来的联网方式。
+  - 故障测试：脚本没法替你关 Clash。请手动验证一次：Clash 正常时 Claude 能用；退出 Clash 后 Claude 应该连不上。
+
+注意：
+  - macOS 部分是按 Proxifier 官方文档和安装包内容写的，没有在真实的 Mac 上跑过；
+    第一次用请先 --all --dry-run 看一遍，再正式执行，并在 Proxifier 窗口里确认 Claude 的连接走了代理。
+  - Clash 端口改了以后要重新执行一次 --all。
+  - 载入 xiaochuan-claude 配置会替换 Proxifier 当前的配置；原来的配置文件已备份，
+    也还在 Proxifier 的 File > Load Profile 里，可以随时切回去。
+  - --local-dns：Proxifier 里 Claude 的域名改用本机 DNS 解析（域名解析出问题时用）。
+  - undo 会删除 Claude Code 代理设置、Proxifier 的 Claude 配置（并退出 Proxifier）、浏览器策略文件。
+    Proxifier 和 Clash 程序本身不卸载。
+
+备份位置（本脚本修改前的 Proxifier 配置、Claude Code 设置）：
+  ~/.xiaochuan-env/proxy-backups/<时间>/
+下载的安装包：
+  ~/.xiaochuan-env/downloads/

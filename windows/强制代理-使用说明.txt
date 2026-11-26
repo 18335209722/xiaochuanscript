@@ -1,0 +1,71 @@
+小川强制代理助手 · Windows 版 1.0.0 · 使用说明
+
+作用：按《Windows Claude 强制代理实施方案》，让 Claude Code / Claude Desktop 只走 Clash 本地代理；
+      代理失效时连接失败，不会自动直连。其他软件保持原有网络方式。
+文件：xiaochuan-proxy.bat + xiaochuan-proxy.ps1（两个文件要放在同一个目录）。
+前提：Clash 已经打开、订阅已导入、节点可用。
+
+运行：
+  双击 xiaochuan-proxy.bat                   交互菜单（输入 a 一键执行）
+  xiaochuan-proxy.bat -All                   直接执行：Proxifier + Claude Code 代理设置 + 防火墙 Kill Switch
+  xiaochuan-proxy.bat -All -DryRun           演练，只显示将要做的事
+  xiaochuan-proxy.bat status                 检查当前状态（√ 到位，× 没到位）
+  xiaochuan-proxy.bat undo                   撤销本脚本做的全部修改
+  xiaochuan-proxy.bat -Help                  全部参数
+
+  脚本会自己弹出 UAC 申请管理员权限，不需要手动「以管理员身份运行」。
+
+脚本做的事（对应方案的章节）：
+  0. 找 Clash 本地代理入口（方案二、三）：从 Clash Verge / Clash for Windows / mihomo 的配置文件和正在监听的端口里
+     自动找出 Mixed / SOCKS / HTTP 端口，判断协议，并真的通过它连一次 Claude 的服务器。
+     不通就停下，不往后做。端口找不到时用 -ProxyPort 指定。
+     电脑上没有任何 Clash 客户端时，会按 CPU（x64 / arm64）下载并静默安装 Clash Verge Rev。
+  1. Proxifier（-Proxifier，方案四）：从官网下载安装包、校验数字签名、静默安装；备份现有配置；
+     写入配置 xiaochuan-claude.ppx 并载入：代理服务器 = Clash 本地入口；
+     规则「Claude via Clash」= claude.exe（Claude Code 和 Claude Desktop 的主程序、辅助进程都叫这个名字）
+     + Claude Code 的版本文件 + Claude Desktop 的更新程序；Localhost 规则和 Default 规则保持 Direct。
+     规则没有「代理失败后直连」的回退。Claude 的域名通过代理解析，不走本机 DNS。Proxifier 设为开机启动。
+  2. Claude Code 代理设置（-ClaudeCode）：在 %USERPROFILE%\.claude\settings.json 的 env 里写入
+     HTTPS_PROXY / HTTP_PROXY = http://127.0.0.1:端口。Claude Code 自己只走这个代理，代理不通就失败。
+     这是 Proxifier 之外的第二层保险：Proxifier 没开、试用到期时 Claude Code 照样只走代理。
+  3. 防火墙 Kill Switch（-KillSwitch，方案七）：给每个 Claude 程序加一条出站阻断规则
+     （规则组「Xiaochuan Claude Proxy」，名字如「Claude Desktop outbound block 1」）：
+     IPv4 / IPv6、TCP / UDP（含 QUIC）一律不许连外网，只放行本机地址（127.0.0.1、::1）。
+     所以 Clash 退出、Proxifier 退出时 Claude 都连不出去。规则加完会马上复查本机代理入口，不通就自动撤掉。
+  4. 浏览器（-Browser，可选，方案五）：用 Chrome / Edge 的「策略」固定代理（写注册表 HKLM\SOFTWARE\Policies），
+     Claude 的网站（claude.ai、claude.com、anthropic.com、claudeusercontent.com）只走 Clash，没有直连回退。
+     -BrowserMode all 时所有网站都走 Clash。扩展被关掉、浏览器设置被重置都改不了策略，比 SwitchyOmega 严格。
+     设置后浏览器会显示「由贵单位管理」，这是正常的。
+  5. IPv6（方案六）：只检查、不关闭。Claude 的 IPv6 直连由第 3 步的防火墙规则拦住。
+     确实要关系统 IPv6 时用 xiaochuan-env.bat -IPv6（还原用 xiaochuan-restore.bat -IPv6）。
+
+脚本做不了、需要你自己做的事：
+  - Clash 的订阅：导入订阅、选节点要你自己来（订阅链接只有你有）。
+  - Proxifier 是收费软件：31 天试用，启动时的试用窗口要点一下；到期后要自己购买并输入注册码。
+    试用到期、Proxifier 不工作时，Claude Desktop 会因为 Kill Switch 而连不上（不会直连）；Claude Code 靠第 2 步照常走代理。
+  - 故障测试（方案七的清单）：脚本没法替你关 Clash。请手动验证一次：
+      □ Clash 正常时，Claude Code、Claude Desktop 都能用；Proxifier 窗口里 claude.exe 的连接显示走代理。
+      □ 退出 Clash：两个 Claude 都应该连接失败。
+      □ 退出 Proxifier：两个 Claude 都不应该直连（Claude Desktop 连不上；Claude Code 仍走自己的代理设置）。
+    特别是「Proxifier + 防火墙规则」的组合：如果装完后 Claude Desktop 在 Clash 正常时也连不上，
+    说明这台电脑上防火墙规则拦住了 Proxifier 的接管，执行 xiaochuan-proxy.bat undo 后只做 -Proxifier -ClaudeCode。
+  - SwitchyOmega 扩展：扩展里的情景模式没法用脚本配置，所以浏览器这一步改用上面的「策略」实现。
+  - 用 npm 装的 Claude Code（由 node.exe 运行）：Proxifier 和防火墙分不清是哪个 node 程序，默认不管它，
+    只有第 2 步对它生效。建议改用官方安装版；一定要管的话加 -IncludeNode（所有 node 程序都会走代理）。
+  - Claude Code 调用的其他程序（git、npm、curl 等）不在规则里，它们保持原来的联网方式。
+
+注意：
+  - Claude 更新后程序路径会变（尤其是 Claude Desktop），防火墙规则是按路径加的。
+    更新后运行一次 xiaochuan-proxy.bat status，提示「还没有规则」时重新执行一次 -All 即可。
+  - Clash 端口改了以后也要重新执行一次 -All。
+  - 载入 xiaochuan-claude 配置会替换 Proxifier 当前的配置；原来的配置文件已备份，
+    也还在 Proxifier 的 File > Load Profile 里，可以随时切回去。
+  - -LocalDns：Claude 的域名改用本机 DNS 解析。Proxifier 提示「Name resolution over proxy has been automatically
+    disabled」或 Claude Desktop 解析域名出问题时用它。
+  - undo 会删除防火墙规则、Claude Code 代理设置、浏览器策略、Proxifier 的 Claude 配置和开机启动项，并退出 Proxifier。
+    Proxifier 和 Clash 程序本身不卸载。
+
+备份位置（本脚本修改前的 Proxifier 配置、Claude Code 设置）：
+  %USERPROFILE%\.xiaochuan-env\proxy-backups\<时间>\
+下载的安装包：
+  %USERPROFILE%\.xiaochuan-env\downloads\

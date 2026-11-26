@@ -1,0 +1,111 @@
+Claude Code 走代理 · 配置流程
+
+目标：让 Claude Code 只走 Clash 本地代理。代理不通时连接失败，不会自动直连。
+适用：Windows / macOS / Linux。
+范围：只管 Claude Code 自己；Claude Desktop 和浏览器不在这份流程里（见各目录的「强制代理-使用说明.txt」）。
+
+
+一、准备
+  1. 打开 Clash，确认订阅已导入、节点可用。
+  2. 在 Clash 的端口设置里看 Mixed Port（混合端口），记下端口号。
+       Clash Verge 默认 7897，Clash for Windows 默认 7890，以你自己界面上显示的为准。
+  3. 确认监听地址是 127.0.0.1。
+  注意：Claude Code 只支持 HTTP 代理，不支持 SOCKS。
+        必须用 Mixed Port 或 HTTP Port，不能填纯 SOCKS 端口。
+
+
+二、方式 A：用脚本（推荐）
+  Windows：
+      windows\xiaochuan-proxy.bat -ClaudeCode
+      （会弹出 UAC，点「是」）
+  macOS / Linux：
+      bash unix/xiaochuan-proxy.sh --claude-code
+      （不要在前面加 sudo）
+
+  脚本会依次做：
+      1) 自动找 Clash 的本地代理端口；
+      2) 真的通过它连一次 Claude 的服务器，不通就停下，不改任何东西；
+      3) 备份原来的设置文件；
+      4) 把代理写进 Claude Code 的设置文件；
+      5) 读回核对，打印「执行结果」。
+
+  端口不是常见值、脚本找不到时，手动指定：
+      Windows：       xiaochuan-proxy.bat -ClaudeCode -ProxyPort 7897
+      macOS / Linux： bash xiaochuan-proxy.sh --claude-code --proxy-port 7897
+
+  想先看看会做什么、不实际修改：
+      Windows：       xiaochuan-proxy.bat -ClaudeCode -DryRun
+      macOS / Linux： bash xiaochuan-proxy.sh --claude-code --dry-run
+
+
+三、方式 B：手动配置
+  1. 找到 Claude Code 的设置文件（没有就新建）：
+       Windows：       C:\Users\<用户名>\.claude\settings.json
+       macOS / Linux： ~/.claude/settings.json
+  2. 先把这个文件复制一份留作备份。
+  3. 在文件里加上 env 这一段，把 7897 换成你的 Mixed Port：
+
+       {
+         "env": {
+           "HTTPS_PROXY": "http://127.0.0.1:7897",
+           "HTTP_PROXY": "http://127.0.0.1:7897",
+           "NO_PROXY": "localhost,127.0.0.1,::1"
+         }
+       }
+
+     文件里已经有其他内容时，只加 "env" 这一项，不要覆盖别的；
+     已经有 "env" 时，把上面三行加进去。注意逗号和括号，保存后必须还是合法的 JSON。
+  4. 保存文件。
+
+
+四、生效
+  完全退出 Claude Code，再重新打开。已经开着的会话不会自动用上新设置。
+
+
+五、验证
+  1. 看设置有没有写对：
+       Windows：       xiaochuan-proxy.bat status
+       macOS / Linux： bash xiaochuan-proxy.sh status
+     「Claude Code 代理设置」一行是 √（或 ✓）就是写好了。
+     这个命令还会检查 Proxifier、防火墙等其他项目；只配 Claude Code 时，那几行标 × 可以不管。
+  2. Clash 正常时：打开 Claude Code 发一句话，能正常回复。
+  3. 退出 Clash：再发一句话，应该报连接失败。
+     能失败才说明没有直连；如果退出 Clash 后还能用，说明设置没生效，回到第三、四步检查。
+  4. 重新打开 Clash，Claude Code 恢复正常。
+
+
+六、常见问题
+  连不上，报代理错误：
+      Clash 没开，或端口改过了。核对 Mixed Port，重新执行一次方式 A 或改方式 B 里的端口。
+  脚本说「没找到在监听的代理端口」：
+      Clash 没开，或端口不常见。打开 Clash，或用 -ProxyPort / --proxy-port 指定。
+  脚本说「在监听，但连不上 Claude 的服务器」：
+      端口是对的，但节点不可用。在 Clash 里换一个能用的节点。
+  脚本说「只支持 HTTP 代理，但没找到 HTTP / 混合端口」：
+      Clash 只开了 SOCKS 端口。到 Clash 里打开 Mixed Port。
+  改了设置没反应：
+      没有完全退出 Claude Code。关掉所有 Claude Code 窗口和终端后重开。
+  手动改完后 Claude Code 报设置文件错误：
+      JSON 写坏了（多了或少了逗号、括号）。用备份还原，重新改。
+
+
+七、撤销
+  方式 A：
+      Windows：       xiaochuan-proxy.bat undo
+      macOS / Linux： bash xiaochuan-proxy.sh undo
+      注意：undo 会撤销这个脚本做过的全部修改（包括 Proxifier 配置、防火墙规则、浏览器策略），
+            不只是 Claude Code 这一项。
+  方式 B：
+      打开 settings.json，删掉 HTTPS_PROXY、HTTP_PROXY、NO_PROXY 三行，保存后重开 Claude Code。
+  脚本修改前的备份在：
+      Windows：       %USERPROFILE%\.xiaochuan-env\proxy-backups\<时间>\claude\settings.json
+      macOS / Linux： ~/.xiaochuan-env/proxy-backups/<时间>/claude/settings.json
+
+
+八、这样配置管不到的地方
+  - Claude Code 调用的其他程序（git、npm、curl 等）不受这个设置约束，保持原来的联网方式。
+  - Claude Desktop 和浏览器里的 claude.ai 不受影响，要另外配置。
+  - Clash 改了端口后必须同步改这里，否则 Claude Code 会一直连不上（不会直连）。
+  - 这个设置可以被人改掉或删掉。要做到「改了设置也不能直连」，Windows 上再加防火墙 Kill Switch：
+        xiaochuan-proxy.bat -ClaudeCode -KillSwitch
+    macOS / Linux 的系统防火墙不能按程序拦截，没有对应的办法。
